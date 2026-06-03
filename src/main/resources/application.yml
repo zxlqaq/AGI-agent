@@ -1,0 +1,61 @@
+server:
+  port: 8090
+
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
+
+app:
+  llm:
+    api-url: https://ark.cn-beijing.volces.com/api/v3/chat/completions
+    api-key: <api_key>
+    model: ep-20260430233018-tqktj
+    temperature: 0.7
+  embedding:
+    api-url: https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal
+    api-key: <api_key>
+    model: ep-20260119190844-zzrq7
+  milvus:
+    host: localhost
+    port: 19530
+  postgres:
+    host: localhost
+    port: 5432
+    user: aiagent
+    password: aiagent123
+    database: aiagent
+  elasticsearch:
+    addresses: http://localhost:9200
+    username: elastic
+    password: changeme
+  kafka:
+    brokers: localhost:29092
+    topic: agent-events
+  rag:
+    chunk-size: 200
+    chunk-overlap: 50
+    top-k: 3
+    rrf-constant-k: 60
+    semantic-weight: 0.7
+    enable-hybrid-search: true
+    rag-milvus-dim: 2048
+  memory:
+    short-term-max-turns: 5
+    long-term-top-k: 3
+    consolidation:
+      similarity-threshold: 0.80
+      dedup-threshold: 0.95
+      ttl-days: 30
+      decay-rate: 0.995
+      min-importance: 0.3
+      trigger-interval: 5
+  harness:
+    max-retries: 3
+    retry-delay-ms: 200
+    step-timeout-ms: 5000
+    max-iterations: 5
+  search:
+    api-key: <api_key>
+    api-url: "https://api.tavily.com/search"
