@@ -1,5 +1,6 @@
 package com.zxl.agi.service.rag;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.zxl.agi.config.AppConfig;
 import com.zxl.agi.infrastructure.InfrastructureService;
 import com.zxl.agi.model.Chunk;
@@ -10,7 +11,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
@@ -52,28 +55,69 @@ public class HybridStore {
      * Index 将 chunks 持久化到 PG + Milvus + ES，返回文档哈希（用于后续删除）
      */
     public String index(List<Chunk> chunks, String docContent) {
-        String docHash = sha256(docContent).substring(0, 16);
+        // 计算文档哈希（幂等摄入）
+        String docHash = sha256(docContent);
 
+        List<Long> pgIds = new ArrayList<>();
+        List<String> contents = new ArrayList<>();
+        List<List<Float>> embeddings = new ArrayList<>();
+
+        // 遍历处理每个 Chunk
         for (int i = 0; i < chunks.size(); i++) {
+            // Embedding 向量化
             Chunk c = chunks.get(i);
             List<Double> emb = null;
+            String embJson = "null"; // Go 中 json.Marshal(nil) 结果为 "null"
             if (embedFn != null) {
-                emb = embedFn.apply(c.getContent());
-            }
-            String embJson = "null";
-            if (emb != null && !emb.isEmpty()) {
                 try {
+                    emb = embedFn.apply(c.getContent());
                     embJson = mapper.writeValueAsString(emb);
-                } catch (Exception ignored) {
-                    
+                } catch (JsonProcessingException e) {
+                    log.warn("⚠️ RAG chunk embedding JSON序列化失败 (idx={}): {}", i, e.getMessage());
                 }
             }
+
+            // 持久化到 PostgreSQL
             long pgId = infra.saveRAGChunk(docHash, i, c.getContent(), embJson);
             if (pgId < 0) {
                 log.warn("RAG chunk 写入 PG 失败 (idx={})", i);
             }
-            // ES/Milvus indexing would happen here if connected
+
+            // 索引到 Elasticsearch
+            if ("connected".equals(infra.getEsStatus())) {
+                try {
+                    infra.indexRagChunk(pgId, c.getContent(), docHash, i);
+                } catch (Exception e) {
+                    log.warn("RAG chunk索引ES失败 pgId={}, error={}", pgId, e.getMessage());
+                }
+            }
+            // 收集 Milvus 批量写入数据
+            if ("connected".equals(infra.getMilvusStatus())
+                    && emb != null
+                    && !emb.isEmpty()) {
+                pgIds.add(pgId);
+                contents.add(c.getContent());
+                List<Float> vector = emb.stream()
+                        .map(Double::floatValue)
+                        .toList();
+
+                embeddings.add(vector);
+            }
         }
+
+        // 批量写Milvus
+        if (!pgIds.isEmpty()) {
+            try {
+                infra.insertRagChunks(
+                        pgIds,
+                        contents,
+                        embeddings
+                );
+            } catch (Exception e) {
+                log.warn("RAG chunks写入Milvus失败 exception: {}", e.getMessage());
+            }
+        }
+
         return docHash;
     }
 
@@ -102,10 +146,10 @@ public class HybridStore {
     private String sha256(String input) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(input.getBytes());
+            byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
             StringBuilder hex = new StringBuilder();
             for (byte b : hash) hex.append(String.format("%02x", b));
-            return hex.toString();
+            return hex.substring(0, 16);
         } catch (Exception e) {
             return UUID.randomUUID().toString().replace("-", "").substring(0, 16);
         }

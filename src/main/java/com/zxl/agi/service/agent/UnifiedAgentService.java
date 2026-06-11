@@ -94,6 +94,9 @@ public class UnifiedAgentService {
         // Init RAG infra
         infra.initRAGInfra(cfg.getRag().getRagMilvusDim());
 
+        // 初始化 RAG 基础设施（Milvus collection + ES 索引）
+        infra.initRagInfra(cfg.getRag().getRagMilvusDim());
+
         // Register rag_search tool
         tools.put("rag_search", new Tool("rag_search", "从私人黑洞（个人知识库）中检索相关文档内容",
                 List.of(new ToolParam("query", "string", "检索关键词或问题", true)),

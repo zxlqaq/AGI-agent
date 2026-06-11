@@ -1,22 +1,48 @@
 package com.zxl.agi.infrastructure;
 
-import com.zxl.agi.config.AppConfig;
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.mapping.Property;
+import co.elastic.clients.elasticsearch.core.IndexRequest;
+import co.elastic.clients.elasticsearch.core.SearchRequest;
+import co.elastic.clients.elasticsearch.core.SearchResponse;
+import co.elastic.clients.elasticsearch.indices.CreateIndexRequest;
+import co.elastic.clients.json.JsonData;
+import com.alibaba.fastjson.JSON;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.zxl.agi.config.AppConfig;
+import com.zxl.agi.model.ESHit;
+import com.zxl.agi.model.MilvusHit;
+import io.milvus.v2.client.ConnectConfig;
+import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.common.IndexParam;
+import io.milvus.v2.service.collection.request.CreateCollectionReq;
+import io.milvus.v2.service.collection.request.HasCollectionReq;
+import io.milvus.v2.service.vector.request.InsertReq;
+import io.milvus.v2.service.vector.request.SearchReq;
+import io.milvus.v2.service.vector.request.data.FloatVec;
+import io.milvus.v2.service.vector.response.SearchResp;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.io.StringReader;
 import java.sql.*;
 import java.util.*;
 
 @Service
+@RequiredArgsConstructor
 public class InfrastructureService {
 
     private static final Logger log = LoggerFactory.getLogger(InfrastructureService.class);
     private static final ObjectMapper mapper = new ObjectMapper();
 
+    private MilvusClientV2 milvusClient;
+    private final ElasticsearchClient esClient;
     private final AppConfig cfg;
     private Connection pgConn;
 
@@ -25,9 +51,7 @@ public class InfrastructureService {
     private String esStatus = "disconnected";
     private String kafkaStatus = "disconnected";
 
-    public InfrastructureService(AppConfig cfg) {
-        this.cfg = cfg;
-    }
+    private static final String RAG_INDEX = "rag_chunks";
 
     /**
      * 尝试连接所有基础设施，失败则降级为内存模式。
@@ -41,7 +65,9 @@ public class InfrastructureService {
     }
 
     // ─────────────────────────────── 连接初始化 ───────────────────────────────
-
+    /**
+     * connectPostgres 初始化 pgSQL 连接
+     */
     private void connectPostgres() {
         try {
             String url = cfg.getPgJdbcUrl();
@@ -55,16 +81,46 @@ public class InfrastructureService {
         }
     }
 
+    /**
+     * connectMilvus 初始化 Milvus 连接
+     */
     private void connectMilvus() {
-        // Milvus stub - always disconnected in this version
-        log.warn("Milvus 连接跳过 (将使用内存向量库)");
-        milvusStatus = "disconnected";
+        try {
+            // 创建Milvus客户端
+            ConnectConfig connectConfig = ConnectConfig.builder()
+                    .uri("http://" + cfg.getMilvusAddr())
+                    .build();
+            this.milvusClient = new MilvusClientV2(connectConfig);
+            // 更新连接状态
+            milvusStatus = "connected";
+            log.info("✅ Milvus 已连接: {}", cfg.getMilvusAddr());
+        } catch (Exception e) {
+            // 更新连接状态
+            milvusStatus = "disconnected";
+            log.warn("⚠️  Milvus 连接失败: {} (将使用内存向量库)", e.getMessage());
+        }
+
     }
 
+    /**
+     * connectES 初始化 ES 连接
+     */
     private void connectES() {
         // ES stub - always disconnected in this version
-        log.warn("Elasticsearch 连接跳过 (将使用 TF 降级检索)");
-        esStatus = "disconnected";
+        try {
+            // Ping Elasticsearch
+            esClient.info();
+            // 更新连接状态
+            esStatus = "connected";
+
+            log.info("✅ Elasticsearch 已连接: {}", cfg.getElasticsearch().getAddresses());
+
+        } catch (Exception e) {
+            // 更新连接状态
+            esStatus = "disconnected";
+            log.warn("Elasticsearch 连接失败 (将使用 TF 降级检索)，exception：{}", JSON.toJSONString(e.getMessage()));
+        }
+
     }
 
     private void connectKafka() {
@@ -279,6 +335,7 @@ public class InfrastructureService {
         public String content;
     }
 
+    // ─────────────────────── pgSQL 持久化 ───────────────────────
     /**
      * RAG chunk 持久化到 PostgreSQL
      * @param docHash
@@ -366,6 +423,285 @@ public class InfrastructureService {
         return ids;
     }
 
+    // ─────────────────────────────── Elasticsearch ───────────────────────────
+
+    /**
+     * SearchES 在 Elasticsearch 中执行 JSON 查询，返回原始响应字符串
+     * @param index
+     * @param queryJson
+     * @return
+     */
+    public String search(String index, String queryJson) {
+        try {
+            SearchResponse<JsonData> response = esClient.search(s -> s
+                    .index(index)
+                    .withJson(new StringReader(queryJson)), JsonData.class);
+
+            return mapper.writeValueAsString(response);
+        } catch (Exception e) {
+            throw new RuntimeException("ES查询失败", e);
+        }
+    }
+
+    /**
+     * 创建RAG索引
+     */
+    public void ensureRagIndex() {
+        try {
+            boolean exists = esClient.indices()
+                    .exists(e -> e.index(RAG_INDEX))
+                    .value();
+
+            if (exists) {
+                return;
+            }
+
+            CreateIndexRequest request = CreateIndexRequest.of(c -> c
+                    .index(RAG_INDEX)
+                    .mappings(m -> m
+                            .properties("pg_id",
+                                    Property.of(p -> p.long_(l -> l)))
+                            .properties("content",
+                                    Property.of(p -> p.text(t -> t.analyzer("standard"))))
+                            .properties("doc_hash",
+                                    Property.of(p -> p.keyword(k -> k)))
+                            .properties("chunk_idx",
+                                    Property.of(p -> p.integer(i -> i)))
+                    ));
+            esClient.indices().create(request);
+            log.info("ES rag_chunks索引创建成功");
+        } catch (Exception e) {
+            throw new RuntimeException("创建RAG索引失败", e);
+        }
+    }
+
+    /**
+     * 写入RAG Chunk
+     */
+    public void indexRagChunk(Long pgId,
+                              String content,
+                              String docHash,
+                              Integer chunkIdx) {
+        try {
+            Map<String, Object> doc = new HashMap<>();
+            doc.put("pg_id", pgId);
+            doc.put("content", content);
+            doc.put("doc_hash", docHash);
+            doc.put("chunk_idx", chunkIdx);
+
+            IndexRequest<Map<String, Object>> request =
+                    IndexRequest.of(i -> i
+                            .index(RAG_INDEX)
+                            .id(pgId.toString())
+                            .document(doc));
+            esClient.index(request);
+        } catch (Exception e) {
+            throw new RuntimeException("索引RAG Chunk失败", e);
+        }
+    }
+
+    /**
+     * BM25搜索
+     */
+    public List<ESHit> searchRagChunks(String query, Integer topK) {
+
+        try {
+            SearchRequest request = SearchRequest.of(s -> s
+                    .index(RAG_INDEX)
+                    .size(topK)
+                    .query(q -> q
+                            .match(m -> m
+                                    .field("content")
+                                    .query(query))));
+
+            SearchResponse<Map> response =
+                    esClient.search(request, Map.class);
+            List<ESHit> hits = new ArrayList<>();
+            response.hits().hits().forEach(hit -> {
+                Map source = hit.source();
+                if (source == null) {
+                    return;
+                }
+                Object pgIdObj = source.get("pg_id");
+                if (pgIdObj == null) {
+                    return;
+                }
+                Long pgId = ((Number) pgIdObj).longValue();
+                Double score = hit.score() == null
+                        ? 0D
+                        : hit.score();
+                hits.add(new ESHit(pgId, score));
+            });
+            return hits;
+        } catch (Exception e) {
+            throw new RuntimeException("BM25搜索失败", e);
+        }
+    }
+
+
+    // ─────────────────────────────── Milvus ──────────────────────────────────
+    /**
+     * EnsureRAGCollection 创建 rag_chunks Milvus collection（如不存在或维度不匹配则重建）
+     */
+    public void ensureRagCollection(Integer dim) {
+        if (milvusClient == null) {
+            throw new RuntimeException("milvus not connected");
+        }
+
+        try {
+            // 检查Collection是否存在
+            boolean exists = milvusClient.hasCollection(HasCollectionReq.builder()
+                            .collectionName("rag_chunks")
+                            .build());
+            if (exists) {
+                return;
+            }
+
+            // 创建Collection
+            milvusClient.createCollection(CreateCollectionReq.builder()
+                            .collectionName("rag_chunks")
+                            .dimension(dim)
+                            .build());
+            log.info("Milvus rag_chunks collection 已创建");
+        } catch (Exception e) {
+            throw new RuntimeException("create rag_chunks collection failed", e);
+        }
+    }
+
+    /**
+     * InsertRAGChunks 批量将 RAG chunk 向量插入 Milvus
+     */
+    public void insertRagChunks(List<Long> pgIds,
+                                List<String> contents,
+                                List<List<Float>> embeddings) {
+        if (milvusClient == null) {
+            throw new RuntimeException("milvus not connected");
+        }
+
+        try {
+            List<JsonObject> rows = new ArrayList<>();
+            for (int i = 0; i < pgIds.size(); i++) {
+                JsonObject row = new JsonObject();
+                row.addProperty("pg_id", pgIds.get(i));
+                row.addProperty("content", contents.get(i));
+                JsonArray vector = new JsonArray();
+                for (Float v : embeddings.get(i)) {
+                    vector.add(v);
+                }
+                row.add("embedding", vector);
+                rows.add(row);
+            }
+
+            milvusClient.insert(InsertReq.builder()
+                            .collectionName("rag_chunks")
+                            .data(rows)
+                            .build());
+        } catch (Exception e) {
+            throw new RuntimeException("insert rag chunks failed", e);
+        }
+    }
+
+    /**
+     * MilvusSearch 在 Milvus 中进行向量近邻搜索，返回匹配文档ID列表
+     */
+    public List<Long> milvusSearch(String collection,
+                                   List<Float> vector,
+                                   Integer topK) {
+        if (milvusClient == null) {
+            throw new RuntimeException("milvus not connected");
+        }
+
+        try {
+            SearchResp resp = milvusClient.search(SearchReq.builder()
+                    .collectionName(collection)
+                    .annsField("embedding")
+                    .topK(topK)
+                    .outputFields(List.of("pg_id"))
+                    .data(List.of(new FloatVec(vector)))
+                    .build());
+            List<Long> ids = new ArrayList<>();
+            // 遍历查询结果
+            for (List<SearchResp.SearchResult> results : resp.getSearchResults()) {
+                for (SearchResp.SearchResult result : results) {
+                    // TODO 有的版本id会放进result.getEntity()，eg：Long pgId = ((Number) result.getEntity().get("pg_id")).longValue();
+                    Object id = result.getId();
+                    if (id instanceof Number number) {
+                        ids.add(number.longValue());
+                    }
+                }
+            }
+
+            return ids;
+        } catch (Exception e) {
+            throw new RuntimeException("milvus search failed", e);
+        }
+    }
+
+    /**
+     * MilvusSearchWithScores 在 Milvus 中进行向量近邻搜索，返回ID和距离
+     */
+    public List<MilvusHit> milvusSearchWithScores(String collection,
+                                                  List<Float> vector,
+                                                  Integer topK) {
+        if (milvusClient == null) {
+            throw new RuntimeException("milvus not connected");
+        }
+
+        try {
+            SearchResp resp = milvusClient.search(
+                    SearchReq.builder()
+                            .collectionName(collection)
+                            .annsField("embedding")
+                            .topK(topK)
+                            .outputFields(List.of("pg_id"))
+                            .data(List.of(new FloatVec(vector)))
+                            .build()
+            );
+
+            List<MilvusHit> hits = new ArrayList<>();
+            // 遍历查询结果
+            for (List<SearchResp.SearchResult> results : resp.getSearchResults()) {
+                for (SearchResp.SearchResult result : results) {
+                    Object id = result.getId();
+                    if (!(id instanceof Number number)) {
+                        continue;
+                    }
+                    hits.add(new MilvusHit(
+                            number.longValue(),
+                            result.getScore()
+                            )
+                    );
+                }
+            }
+            return hits;
+        } catch (Exception e) {
+            throw new RuntimeException("milvus search failed", e);
+        }
+    }
+
+    /**
+     * InitRAGInfra 初始化RAG所需基础设施
+     */
+    public void initRagInfra(Integer dim) {
+        // 初始化Milvus Collection
+        if ("connected".equals(milvusStatus)) {
+            try {
+                ensureRagCollection(dim);
+            } catch (Exception e) {
+                log.warn("Milvus rag_chunks 初始化失败: {}", e.getMessage());
+            }
+        }
+
+        // 初始化ES索引
+        if ("connected".equals(esStatus)) {
+            try {
+                ensureRagIndex();
+            } catch (Exception e) {
+                log.warn("ES rag_chunks 初始化失败: {}", e.getMessage());
+            }
+        }
+    }
+
     // ─────────────────────────────── 生命周期 ────────────────────────────────
 
     /**
@@ -412,8 +748,6 @@ public class InfrastructureService {
         Collections.reverse(rows);
         return rows;
     }
-
-    // ES TODO
 
     // ===== Kafka (stub) =====
     public void publishEvent(String eventType, String payload) {
