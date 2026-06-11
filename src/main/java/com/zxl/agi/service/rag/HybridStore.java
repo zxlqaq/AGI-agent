@@ -122,10 +122,32 @@ public class HybridStore {
     }
 
     /**
-     * Delete all chunks for a document by its hash.
+     * Delete 按 docHash 删除文档的所有 chunks（PG + ES + Milvus）
      */
-    public List<Long> delete(String docHash) {
-        return infra.deleteRAGChunksByDocHash(docHash);
+    public void delete(String docHash) {
+        // 删除PG中的Chunk并返回对应PGID
+        List<Long> pgIds = infra.deleteRAGChunksByDocHash(docHash);
+        if (pgIds.isEmpty()) {
+            return;
+        }
+
+        // 删除ES索引
+        if ("connected".equals(infra.getEsStatus())) {
+            try {
+                infra.deleteRagChunksFromEs(pgIds);
+            } catch (Exception e) {
+                log.warn("ES 删除 RAG chunks 失败: {}", e.getMessage());
+            }
+        }
+
+        // 删除Milvus向量
+        if ("connected".equals(infra.getEsStatus())) {
+            try {
+                infra.deleteRagChunksFromMilvus(pgIds);
+            } catch (Exception e) {
+                log.warn("Milvus 删除 RAG chunks 失败: {}", e.getMessage());
+            }
+        }
     }
 
     /**

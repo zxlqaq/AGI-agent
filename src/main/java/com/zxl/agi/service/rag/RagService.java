@@ -16,8 +16,8 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * RAG Engine - integrates text splitting, hybrid retrieval, and answer generation.
- * Corresponds to Go: internal/rag/rag.go
+ * RAGService - rag 实现检索增强生成
+ * 包含：文本分割器、混合检索存储（Milvus 语义 + ES BM25 + RRF 融合）、RAG 引擎。
  */
 @Service
 public class RagService {
@@ -70,17 +70,17 @@ public class RagService {
     }
 
     /**
-     * Delete all chunks for a document.
+     * Delete 按 docHash 删除文档的所有 chunks（PG + ES + Milvus）
      */
     public void delete(String docHash) {
         store.delete(docHash);
-        // Reload from PG to update in-memory index
+        // 删除后检查是否还有 chunks
         List<InfrastructureService.ChunkRow> rows = infra.loadAllRAGChunks();
         indexedChunks.clear();
         for (int i = 0; i < rows.size(); i++) {
             indexedChunks.add(new Chunk(i, rows.get(i).content));
         }
-        loaded = !indexedChunks.isEmpty();
+        loaded = !rows.isEmpty();
     }
 
     /**

@@ -16,9 +16,9 @@ import com.zxl.agi.model.ESHit;
 import com.zxl.agi.model.MilvusHit;
 import io.milvus.v2.client.ConnectConfig;
 import io.milvus.v2.client.MilvusClientV2;
-import io.milvus.v2.common.IndexParam;
 import io.milvus.v2.service.collection.request.CreateCollectionReq;
 import io.milvus.v2.service.collection.request.HasCollectionReq;
+import io.milvus.v2.service.vector.request.DeleteReq;
 import io.milvus.v2.service.vector.request.InsertReq;
 import io.milvus.v2.service.vector.request.SearchReq;
 import io.milvus.v2.service.vector.request.data.FloatVec;
@@ -33,6 +33,7 @@ import org.springframework.stereotype.Service;
 import java.io.StringReader;
 import java.sql.*;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -369,7 +370,9 @@ public class InfrastructureService {
         try (Statement stmt = pgConn.createStatement();
              ResultSet rs = stmt.executeQuery("SELECT id, content FROM rag_chunks ORDER BY id")) {
             while (rs.next()) {
-                ChunkRow r = new ChunkRow(); r.id = rs.getLong(1); r.content = rs.getString(2);
+                ChunkRow r = new ChunkRow();
+                r.id = rs.getLong(1);
+                r.content = rs.getString(2);
                 chunks.add(r);
             }
         } catch (SQLException e) {
@@ -412,13 +415,22 @@ public class InfrastructureService {
         try (PreparedStatement ps = pgConn.prepareStatement("SELECT id FROM rag_chunks WHERE doc_hash = ?")) {
             ps.setString(1, docHash);
             try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) ids.add(rs.getLong(1));
+                while (rs.next()) {
+                    ids.add(rs.getLong(1));
+                }
             }
-        } catch (SQLException e) { log.warn("查询 RAG chunks 失败: {}", e.getMessage()); }
+        } catch (SQLException e) {
+            log.warn("查询 RAG chunks 失败: {}", e.getMessage());
+
+        }
         if (!ids.isEmpty()) {
-            try (PreparedStatement ps = pgConn.prepareStatement("DELETE FROM rag_chunks WHERE doc_hash = ?")) {
-                ps.setString(1, docHash); ps.executeUpdate();
-            } catch (SQLException e) { log.warn("删除 RAG chunks 失败: {}", e.getMessage()); }
+            try (PreparedStatement ps = pgConn.prepareStatement(
+                    "DELETE FROM rag_chunks WHERE doc_hash = ?")) {
+                ps.setString(1, docHash);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                log.warn("删除 RAG chunks 失败: {}", e.getMessage());
+            }
         }
         return ids;
     }
@@ -535,6 +547,26 @@ public class InfrastructureService {
             return hits;
         } catch (Exception e) {
             throw new RuntimeException("BM25搜索失败", e);
+        }
+    }
+
+    /**
+     * DeleteRAGChunksFromEs 删除ES中的Chunk索引
+     */
+    public void deleteRagChunksFromEs(List<Long> pgIds) {
+
+        if (esClient == null) {
+            throw new RuntimeException("elasticsearch not connected");
+        }
+
+        try {
+            for (Long pgId : pgIds) {
+                esClient.delete(d -> d
+                        .index("rag_chunks")
+                        .id(pgId.toString()));
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("delete rag chunks from es failed", e);
         }
     }
 
@@ -676,6 +708,32 @@ public class InfrastructureService {
             return hits;
         } catch (Exception e) {
             throw new RuntimeException("milvus search failed", e);
+        }
+    }
+
+    /**
+     * DeleteRAGChunksFromMilvus 删除Milvus中的向量
+     */
+    public void deleteRagChunksFromMilvus(List<Long> pgIds) {
+        if (milvusClient == null) {
+            throw new RuntimeException("milvus not connected");
+        }
+
+        try {
+            String expr = "pg_id in [" +
+                    pgIds.stream()
+                            .map(String::valueOf)
+                            .collect(Collectors.joining(",")) +
+                    "]";
+
+            milvusClient.delete(
+                    DeleteReq.builder()
+                            .collectionName("rag_chunks")
+                            .filter(expr)
+                            .build()
+            );
+        } catch (Exception e) {
+            throw new RuntimeException("delete rag chunks from milvus failed", e);
         }
     }
 
