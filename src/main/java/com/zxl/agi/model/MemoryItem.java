@@ -14,12 +14,12 @@ public class MemoryItem {
     private int id;
     private String content;
     private double importance;
-    private List<Double> embedding;
+    private List<Float> embedding;
     private double score;
     private LocalDateTime createdAt;
     private LocalDateTime lastAccessed;
 
-    public MemoryItem(int id, String content, double importance, List<Double> embedding) {
+    public MemoryItem(int id, String content, double importance, List<Float> embedding) {
         this.id = id; this.content = content; this.importance = importance; this.embedding = embedding;
         this.createdAt = LocalDateTime.now(); this.lastAccessed = LocalDateTime.now();
     }

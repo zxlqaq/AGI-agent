@@ -12,6 +12,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.zxl.agi.config.AppConfig;
+import com.zxl.agi.model.Chunk;
 import com.zxl.agi.model.ESHit;
 import com.zxl.agi.model.MilvusHit;
 import io.milvus.v2.client.ConnectConfig;
@@ -240,7 +241,7 @@ public class InfrastructureService {
         public int id;
         public String content;
         public double importance;
-        public List<Double> embedding;
+        public List<Float> embedding;
         public Timestamp createdAt;
         public Timestamp lastAccessed;
     }
@@ -278,10 +279,16 @@ public class InfrastructureService {
                      "SELECT id, content, importance, embedding, COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW()) FROM long_term_memory ORDER BY id")) {
             while (rs.next()) {
                 LongTermRow row = new LongTermRow();
-                row.id = rs.getInt(1); row.content = rs.getString(2); row.importance = rs.getDouble(3);
+                row.id = rs.getInt(1);
+                row.content = rs.getString(2);
+                row.importance = rs.getDouble(3);
                 String embJson = rs.getString(4);
                 if (embJson != null && !embJson.isEmpty()) {
-                    try { row.embedding = mapper.readValue(embJson, mapper.getTypeFactory().constructCollectionType(List.class, Double.class)); } catch (Exception ignored) {}
+                    try {
+                        row.embedding = mapper.readValue(embJson, mapper.getTypeFactory().constructCollectionType(List.class, Float.class));
+                    } catch (Exception ignored) {
+
+                    }
                 }
                 row.createdAt = rs.getTimestamp(5); row.lastAccessed = rs.getTimestamp(6);
                 items.add(row);
@@ -326,16 +333,6 @@ public class InfrastructureService {
         }
     }
 
-    // ─────────────────────── RAG Chunk 持久化 ───────────────────────
-
-    /**
-     * RAG Chunk
-     */
-    public static class ChunkRow {
-        public long id;
-        public String content;
-    }
-
     // ─────────────────────── pgSQL 持久化 ───────────────────────
     /**
      * RAG chunk 持久化到 PostgreSQL
@@ -364,15 +361,15 @@ public class InfrastructureService {
      * 从 PostgreSQL 加载全部 RAG chunk（用于启动时恢复 TF 索引）
      * @return
      */
-    public List<ChunkRow> loadAllRAGChunks() {
-        List<ChunkRow> chunks = new ArrayList<>();
+    public List<Chunk> loadAllRAGChunks() {
+        List<Chunk> chunks = new ArrayList<>();
         if (pgConn == null) return chunks;
         try (Statement stmt = pgConn.createStatement();
              ResultSet rs = stmt.executeQuery("SELECT id, content FROM rag_chunks ORDER BY id")) {
             while (rs.next()) {
-                ChunkRow r = new ChunkRow();
-                r.id = rs.getLong(1);
-                r.content = rs.getString(2);
+                Chunk r = new Chunk();
+                r.setId(rs.getLong(1));
+                r.setContent(rs.getString(2));
                 chunks.add(r);
             }
         } catch (SQLException e) {
@@ -386,15 +383,17 @@ public class InfrastructureService {
      * @param ids
      * @return
      */
-    public List<ChunkRow> loadRAGChunksByIDs(List<Long> ids) {
-        List<ChunkRow> chunks = new ArrayList<>();
+    public List<Chunk> loadRAGChunksByIDs(List<Long> ids) {
+        List<Chunk> chunks = new ArrayList<>();
         if (pgConn == null || ids.isEmpty()) return chunks;
         String placeholders = String.join(",", ids.stream().map(i -> "?").toArray(String[]::new));
         try (PreparedStatement ps = pgConn.prepareStatement("SELECT id, content FROM rag_chunks WHERE id IN (" + placeholders + ")")) {
             for (int i = 0; i < ids.size(); i++) ps.setLong(i + 1, ids.get(i));
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    ChunkRow r = new ChunkRow(); r.id = rs.getLong(1); r.content = rs.getString(2);
+                    Chunk r = new Chunk();
+                    r.setId(rs.getLong(1));
+                    r.setContent(rs.getString(2));
                     chunks.add(r);
                 }
             }

@@ -28,7 +28,7 @@ public class TextSplitter {
         for (int i = 0; i < codePoints.length; i += step) {
             int end = Math.min(i + chunkSize, codePoints.length);
             String content = new String(codePoints, i, end - i);
-            chunks.add(new Chunk(id++, content));
+            chunks.add(new Chunk((long) id++, content));
             if (end >= codePoints.length) break;
         }
         return chunks;

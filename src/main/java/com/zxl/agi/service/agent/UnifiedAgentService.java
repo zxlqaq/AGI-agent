@@ -89,7 +89,7 @@ public class UnifiedAgentService {
             }
             return llm.chat(fullSystem, List.of(Map.of("role", "user", "content", userMsg)));
         });
-        rag.setEmbedFn(text -> llm.embed(text));
+        rag.setEmbedFn(llm::embed);
 
         // Init RAG infra
         infra.initRAGInfra(cfg.getRag().getRagMilvusDim());
@@ -157,7 +157,7 @@ public class UnifiedAgentService {
                 for (Map.Entry<String, String> e : kvs.entrySet()) {
                     infra.savePreference("default", e.getKey(), e.getValue());
                     String content = "用户" + e.getKey() + ": " + e.getValue();
-                    List<Double> emb = llm.embed(content);
+                    List<Float> emb = llm.embed(content);
                     if (ltm.store(content, 0.8, emb)) {
                         String embJson = "null";
                         try { if (emb != null) embJson = mapper.writeValueAsString(emb); } catch (Exception ignored) {}
@@ -724,7 +724,7 @@ public class UnifiedAgentService {
         String prefCtx = pref.buildContext();
         if (!prefCtx.isEmpty()) parts.add(prefCtx);
 
-        List<Double> queryEmb = llm.embed(query);
+        List<Float> queryEmb = llm.embed(query);
         List<MemoryItem> recalled = ltm.recall(query, cfg.getMemory().getLongTermTopK(), queryEmb);
         if (!recalled.isEmpty()) {
             List<String> contents = recalled.stream().map(MemoryItem::getContent).toList();
@@ -808,7 +808,7 @@ public class UnifiedAgentService {
                 pref.save(e.getKey(), e.getValue());
                 infra.savePreference("default", e.getKey(), e.getValue());
                 String content = "用户" + e.getKey() + ": " + e.getValue();
-                List<Double> emb = llm.embed(content);
+                List<Float> emb = llm.embed(content);
                 if (ltm.store(content, 0.7, emb)) {
                     String embJson = "null";
                     try { if (emb != null) embJson = mapper.writeValueAsString(emb); } catch (Exception ignored) {}
@@ -875,11 +875,11 @@ public class UnifiedAgentService {
      * PostgreSQL 加载持久化的 RAG chunks 到 TF 兜底索引
      */
     private void restoreRAGFromDB() {
-        List<InfrastructureService.ChunkRow> chunkRows = infra.loadAllRAGChunks();
+        List<Chunk> chunkRows = infra.loadAllRAGChunks();
         if (chunkRows.isEmpty()) return;
         List<Chunk> chunks = new ArrayList<>();
         for (int i = 0; i < chunkRows.size(); i++) {
-            chunks.add(new Chunk(i, chunkRows.get(i).content));
+            chunks.add(new Chunk((long) i, chunkRows.get(i).getContent()));
         }
         rag.restoreChunks(chunks);
         log.info("✅ RAG chunks 恢复：{} 条", chunks.size());

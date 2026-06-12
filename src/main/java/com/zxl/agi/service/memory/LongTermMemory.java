@@ -36,7 +36,7 @@ public class LongTermMemory {
      * @param embedding
      * @return
      */
-    public boolean store(String content, double importance, List<Double> embedding) {
+    public boolean store(String content, double importance, List<Float> embedding) {
         // 去重检测：与已有条目相似度过高时跳过，但更新已有条目的访问时间和重要性
         if (consolidationCfg != null && !items.isEmpty() && embedding != null && !embedding.isEmpty()) {
             for (MemoryItem item : items) {
@@ -101,7 +101,7 @@ public class LongTermMemory {
      * @param queryEmbedding
      * @return
      */
-    public List<MemoryItem> recall(String query, int topK, List<Double> queryEmbedding) {
+    public List<MemoryItem> recall(String query, int topK, List<Float> queryEmbedding) {
         if (items.isEmpty()) return Collections.emptyList();
         // 综合得分阈值：sim*0.7 + importance*0.3
         final double threshold = 0.4;
@@ -313,9 +313,9 @@ public class LongTermMemory {
             double wA = base.getImportance(), wB = other.getImportance();
             double total = wA + wB;
             if (total > 0) {
-                List<Double> mergedEmb = new ArrayList<>();
+                List<Float> mergedEmb = new ArrayList<>();
                 for (int i = 0; i < base.getEmbedding().size(); i++) {
-                    mergedEmb.add((base.getEmbedding().get(i) * wA + other.getEmbedding().get(i) * wB) / total);
+                    mergedEmb.add((float) ((base.getEmbedding().get(i) * wA + other.getEmbedding().get(i) * wB) / total));
                 }
                 merged.setEmbedding(mergedEmb);
             }
@@ -358,16 +358,16 @@ public class LongTermMemory {
      * @param b
      * @return
      */
-    public static double cosine(List<Double> a, List<Double> b) {
+    public static float cosine(List<Float> a, List<Float> b) {
         if (a.size() != b.size()) return 0;
-        double dot = 0, na = 0, nb = 0;
+        float dot = 0, na = 0, nb = 0;
         for (int i = 0; i < a.size(); i++) {
             dot += a.get(i) * b.get(i);
             na += a.get(i) * a.get(i);
             nb += b.get(i) * b.get(i);
         }
         if (na == 0 || nb == 0) return 0;
-        return dot / (Math.sqrt(na) * Math.sqrt(nb));
+        return (float) (dot / (Math.sqrt(na) * Math.sqrt(nb)));
     }
 
     private static double cosineArr(double[] a, double[] b) {

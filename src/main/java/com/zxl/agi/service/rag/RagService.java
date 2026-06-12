@@ -3,6 +3,7 @@ package com.zxl.agi.service.rag;
 import com.zxl.agi.config.AppConfig;
 import com.zxl.agi.infrastructure.InfrastructureService;
 import com.zxl.agi.model.Chunk;
+import com.zxl.agi.model.HybridResult;
 import com.zxl.agi.service.memory.LongTermMemory;
 import lombok.Getter;
 import lombok.Setter;
@@ -33,7 +34,7 @@ public class RagService {
     private boolean loaded = false;
     @Setter
     private BiFunction<String, String, String> generateFn;
-    private Function<String, List<Double>> embedFn;
+    private Function<String, List<Float>> embedFn;
 
     // In-memory TF index (fallback when Milvus/ES unavailable)
     private final List<Chunk> indexedChunks = Collections.synchronizedList(new ArrayList<>());
@@ -47,7 +48,7 @@ public class RagService {
         this.splitter.setOverlap(cfg.getRag().getChunkOverlap());
     }
 
-    public void setEmbedFn(Function<String, List<Double>> fn) {
+    public void setEmbedFn(Function<String, List<Float>> fn) {
         this.embedFn = fn;
         this.store.setEmbedFn(fn);
     }
@@ -75,10 +76,10 @@ public class RagService {
     public void delete(String docHash) {
         store.delete(docHash);
         // 删除后检查是否还有 chunks
-        List<InfrastructureService.ChunkRow> rows = infra.loadAllRAGChunks();
+        List<Chunk> rows = infra.loadAllRAGChunks();
         indexedChunks.clear();
         for (int i = 0; i < rows.size(); i++) {
-            indexedChunks.add(new Chunk(i, rows.get(i).content));
+            indexedChunks.add(new Chunk((long) i, rows.get(i).getContent()));
         }
         loaded = !rows.isEmpty();
     }
@@ -92,14 +93,22 @@ public class RagService {
         }
 
         // TF-based search (fallback when Milvus/ES unavailable)
-        List<ScoredChunk> results = tfSearch(question, cfg.getRag().getTopK());
-
-        if (results.isEmpty()) {
+//        List<ScoredChunk> results = tfSearch(question, cfg.getRag().getTopK());
+        List<HybridResult> hybridResults = store.search(question, cfg.getRag().getTopK());
+        if (hybridResults.isEmpty()) {
             return new QueryResult("知识库中未找到相关内容。", Collections.emptyList());
         }
 
+        List<ScoredChunk> results = hybridResults.stream()
+                .map(hr -> new ScoredChunk(
+                        hr.getChunk(),
+                        hr.getScore()
+                ))
+                .toList();
+
         String context = results.stream()
                 .map(r -> r.chunk.getContent())
+                .filter(s -> s != null && !s.isBlank())
                 .collect(Collectors.joining("\n\n"));
 
         String answer;
@@ -118,11 +127,11 @@ public class RagService {
      * Get all chunks (for status API).
      */
     public List<Chunk> getChunks() {
-        List<InfrastructureService.ChunkRow> rows = infra.loadAllRAGChunks();
+        List<Chunk> rows = infra.loadAllRAGChunks();
         if (!rows.isEmpty()) {
             List<Chunk> chunks = new ArrayList<>();
             for (int i = 0; i < rows.size(); i++) {
-                chunks.add(new Chunk(i, rows.get(i).content));
+                chunks.add(new Chunk((long) i, rows.get(i).getContent()));
             }
             return chunks;
         }
@@ -136,7 +145,6 @@ public class RagService {
         indexedChunks.clear();
         indexedChunks.addAll(chunks);
         loaded = !chunks.isEmpty();
-        store.restoreChunks(chunks);
     }
 
     // ===== TF-based search (fallback) =====

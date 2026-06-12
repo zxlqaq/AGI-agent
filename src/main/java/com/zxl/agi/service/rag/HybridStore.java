@@ -3,7 +3,7 @@ package com.zxl.agi.service.rag;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.zxl.agi.config.AppConfig;
 import com.zxl.agi.infrastructure.InfrastructureService;
-import com.zxl.agi.model.Chunk;
+import com.zxl.agi.model.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.Getter;
 import lombok.Setter;
@@ -13,11 +13,9 @@ import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * HybridStore - 实现企业级混合检索
@@ -35,7 +33,7 @@ public class HybridStore {
     private final AppConfig cfg;
     private final InfrastructureService infra;
     @Setter
-    private Function<String, List<Double>> embedFn;
+    private Function<String, List<Float>> embedFn;
     @Getter
     private String mode = "unavailable";
 
@@ -66,7 +64,7 @@ public class HybridStore {
         for (int i = 0; i < chunks.size(); i++) {
             // Embedding 向量化
             Chunk c = chunks.get(i);
-            List<Double> emb = null;
+            List<Float> emb = null;
             String embJson = "null"; // Go 中 json.Marshal(nil) 结果为 "null"
             if (embedFn != null) {
                 try {
@@ -97,11 +95,7 @@ public class HybridStore {
                     && !emb.isEmpty()) {
                 pgIds.add(pgId);
                 contents.add(c.getContent());
-                List<Float> vector = emb.stream()
-                        .map(Double::floatValue)
-                        .toList();
-
-                embeddings.add(vector);
+                embeddings.add(emb);
             }
         }
 
@@ -119,6 +113,23 @@ public class HybridStore {
         }
 
         return docHash;
+    }
+
+    /**
+     * 计算文档哈希
+     * @param input
+     * @return
+     */
+    private String sha256(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (byte b : hash) hex.append(String.format("%02x", b));
+            return hex.substring(0, 16);
+        } catch (Exception e) {
+            return UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+        }
     }
 
     /**
@@ -150,40 +161,189 @@ public class HybridStore {
         }
     }
 
+    // ─────────────────────── Search入口 ──────────────────────────────
+    public List<HybridResult> search(String query, int topK) {
+
+        return switch (mode) {
+            case "hybrid" -> searchHybrid(query, topK);
+            case "semantic" -> searchSemantic(query, topK);
+            case "keyword" -> searchKeyword(query, topK);
+            default -> {
+                log.warn("⚠️ 检索基础设施不可用（Milvus 和 ES 均未连接）");
+                yield Collections.emptyList();
+            }
+        };
+    }
+
+    // ─────────────────────── Hybrid (RRF融合) ──────────────────────────────
     /**
-     * Search - currently returns empty since Milvus/ES unavailable.
-     * RAG falls back to TF-based search in RagService.
+     *  Milvus 语义 + ES BM25，使用 Reciprocal Rank Fusion 融合
+     * @param query
+     * @param topK
+     * @return
      */
-    public List<SearchResult> search(String query, int topK) {
-        // In "unavailable" mode, return empty - RagService handles TF fallback
-        return Collections.emptyList();
-    }
-
-    public void restoreChunks(List<Chunk> chunks) {
-        // Chunks already in PG, no additional action needed
-    }
-
-    // ===== Helper =====
-
-    private String sha256(String input) {
+    private List<HybridResult> searchHybrid(String query, int topK) {
+        // 查询向量化
+        List<Float> queryEmb;
         try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder();
-            for (byte b : hash) hex.append(String.format("%02x", b));
-            return hex.substring(0, 16);
+            queryEmb = embedFn.apply(query);
         } catch (Exception e) {
-            return UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+            log.warn("⚠️ 查询向量化失败，降级关键词: {}", e.getMessage());
+            return searchKeyword(query, topK);
+        }
+
+        // 从两路各取 2*topK 保证融合后有足够候选
+        int fetchK = Math.max(topK * 2, 10);
+
+        List<MilvusHit> milvusHits;
+        List<ESHit> esHits;
+
+        try {
+            milvusHits = infra.milvusSearchWithScores("rag_chunks", queryEmb, fetchK);
+        } catch (Exception e) {
+            log.warn("⚠️ Milvus检索失败，降级ES使用关键词检索: {}", e.getMessage());
+            return searchKeyword(query, topK);
+        }
+
+        try {
+            esHits = infra.searchRagChunks(query, fetchK);
+        } catch (Exception e) {
+            log.warn("⚠️ ES检索失败，使用语义检索: {}", e.getMessage());
+            return searchSemantic(query, topK);
+        }
+
+        // RRF fusion：: score(d) = Σ 1/(k + rank_i(d))
+        Map<Long, Double> rrfScores = new HashMap<>();
+        int rrfK = cfg.getRag().getRrfConstantK();
+        for (int rank = 0; rank < milvusHits.size(); rank++) {
+            MilvusHit hit = milvusHits.get(rank);
+            rrfScores.merge(
+                    hit.getId(),
+                    1.0 / (rrfK + rank + 1),
+                    Double::sum
+            );
+        }
+
+        for (int rank = 0; rank < esHits.size(); rank++) {
+            ESHit hit = esHits.get(rank);
+            rrfScores.merge(
+                    hit.getPgId(),
+                    1.0 / (rrfK + rank + 1),
+                    Double::sum
+            );
+        }
+
+
+        // 按 RRF 分数排序
+        List<Long> sortedIds = rrfScores.entrySet()
+                .stream()
+                .sorted(Map.Entry.<Long, Double>comparingByValue().reversed())
+                .limit(topK)
+                .map(Map.Entry::getKey)
+                .toList();
+
+        // 从 PG 批量取回 chunk 内容
+        Map<Long, String> contentMap = loadContent(sortedIds);
+
+        return sortedIds.stream()
+                .map(id -> new HybridResult(
+                        new Chunk(id, contentMap.get(id)),
+                        rrfScores.get(id),
+                        "hybrid"
+                ))
+                .filter(r -> r.getChunk().getContent() != null)
+                .toList();
+    }
+
+    /**
+     * PG批量回填
+     * @param ids
+     * @return
+     */
+    private Map<Long, String> loadContent(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        try {
+            return infra.loadRAGChunksByIDs(ids)
+                    .stream()
+                    .collect(Collectors.toMap(
+                            Chunk::getId,
+                            Chunk::getContent,
+                            (a, b) -> a
+                    ));
+        } catch (Exception e) {
+            log.warn("⚠️ PG加载失败: {}", e.getMessage());
+            return Collections.emptyMap();
         }
     }
 
-    public static class SearchResult {
-        public Chunk chunk;
-        public double score;
-        public String source;
-
-        public SearchResult(Chunk chunk, double score, String source) {
-            this.chunk = chunk; this.score = score; this.source = source;
+    /**
+     * Elasticsearch BM25 关键词检索
+     * @param query
+     * @param topK
+     * @return
+     */
+    private List<HybridResult> searchKeyword(String query, int topK) {
+        List<ESHit> hits;
+        try {
+            hits = infra.searchRagChunks(query, topK);
+        } catch (Exception e) {
+            log.warn("⚠️ ES失败: {}", e.getMessage());
+            return Collections.emptyList();
         }
+
+        List<Long> ids = hits.stream()
+                .map(ESHit::getPgId)
+                .toList();
+
+        Map<Long, String> contentMap = loadContent(ids);
+
+        return hits.stream()
+                .map(h -> new HybridResult(
+                        new Chunk(h.getPgId(), contentMap.get(h.getPgId())),
+                        h.getScore(),
+                        "keyword"
+                ))
+                .toList();
+    }
+
+    /**
+     * Milvus 语义向量检索
+     * @param query
+     * @param topK
+     * @return
+     */
+    private List<HybridResult> searchSemantic(String query, int topK) {
+        List<Float> emb;
+        try {
+            emb = embedFn.apply(query);
+        } catch (Exception e) {
+            log.warn("⚠️ embedding失败: {}", e.getMessage());
+            return Collections.emptyList();
+        }
+
+        List<MilvusHit> hits;
+        try {
+            hits = infra.milvusSearchWithScores("rag_chunks", emb, topK);
+        } catch (Exception e) {
+            log.warn("⚠️ Milvus失败: {}", e.getMessage());
+            return Collections.emptyList();
+        }
+
+        List<Long> ids = hits.stream()
+                .map(MilvusHit::getId)
+                .toList();
+
+        Map<Long, String> contentMap = loadContent(ids);
+
+        return hits.stream()
+                .map(h -> new HybridResult(
+                        new Chunk(h.getId(), contentMap.get(h.getId())),
+                        (double) h.getDistance(),
+                        "semantic"
+                ))
+                .toList();
     }
 }
