@@ -298,7 +298,7 @@ public class UnifiedAgentService {
         CompletableFuture.runAsync(() -> {
             try {
                 if (ltm.needConsolidation()) {
-                    LongTermMemory.ConsolidationResult result = ltm.consolidate();
+                    ConsolidationResult result = ltm.consolidate();
                     syncConsolidationToDB(result);
                 }
             } catch (Exception e) {
@@ -1004,7 +1004,7 @@ public class UnifiedAgentService {
      * 将记忆合并结果同步到 PostgreSQL
      * @param result
      */
-    private void syncConsolidationToDB(LongTermMemory.ConsolidationResult result) {
+    private void syncConsolidationToDB(ConsolidationResult result) {
         if (!result.deleteFromDB.isEmpty()) {
             infra.deleteLongTermItems(result.deleteFromDB);
             log.info("🧹 记忆合并：删除 {} 条（去重={}, 合并={}, 过期={}）",

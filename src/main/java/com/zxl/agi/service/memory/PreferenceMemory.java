@@ -8,6 +8,7 @@ import java.util.stream.Collectors;
 
 /**
  * 用户偏好：从对话中自动提取并持久化的键值对
+ * TODO 用户偏好持久化pgSQL(JSONB存储)
  */
 @Component
 public class PreferenceMemory {

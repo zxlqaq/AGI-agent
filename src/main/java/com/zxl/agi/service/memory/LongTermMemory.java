@@ -1,64 +1,117 @@
 package com.zxl.agi.service.memory;
 
 import com.zxl.agi.config.AppConfig;
+import com.zxl.agi.model.ConsolidationResult;
 import com.zxl.agi.model.LongTermMemoryItem;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import org.apache.commons.collections.CollectionUtils;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * 长期记忆：支持语义向量（embedding）或 TF 词袋降级
+ * 长期记忆：支持：
+ * 1. 语义向量召回
+ * 2. TF词袋降级召回
+ * 3. 自动记忆合并
+ * 4. 自动去重
+ * 5. 自动衰减
+ * TODO 长期记忆持久化向量数据库
  */
 @Component
 public class LongTermMemory {
+    /**
+     * 长期记忆列表
+     */
+    private final List<LongTermMemoryItem> items = new CopyOnWriteArrayList<>();
 
-    private final List<LongTermMemoryItem> items = Collections.synchronizedList(new ArrayList<>());
+    /**
+     * TF词袋词典
+     *
+     * word -> index
+     */
     private final Map<String, Integer> vocabId = new HashMap<>();
+
+    /**
+     * 词汇表
+     */
     private final List<String> vocab = new ArrayList<>();
+
+    /**
+     * 下一个内存ID
+     */
     private Long nextId = 0L;
+
+    /**
+     * 累计存储次数
+     */
     private int storeCount = 0;
+
+    /**
+     * 记忆合并配置
+     */
     private AppConfig.ConsolidationConfig consolidationCfg;
 
     public void setConsolidationConfig(AppConfig.ConsolidationConfig cfg) {
         this.consolidationCfg = cfg;
     }
 
-    public List<LongTermMemoryItem> getItems() { return new ArrayList<>(items); }
+    public List<LongTermMemoryItem> getItems() {
+        return new ArrayList<>(items);
+    }
 
-    public int size() { return items.size(); }
+    public int size() {
+        return items.size();
+    }
 
     /**
-     * 将内容存入长期记忆（embedding 可选，传 nil 则使用 TF 降级）
+     * 将内容存入长期记忆
      * @param content
      * @param importance
      * @param embedding
      * @return
      */
     public boolean store(String content, double importance, List<Float> embedding) {
-        // 去重检测：与已有条目相似度过高时跳过，但更新已有条目的访问时间和重要性
+        if (content == null || content.isBlank()) {
+            return false;
+        }
+        // 1. 去重检测：与已有条目相似度过高时跳过，但更新已有条目的访问时间和重要性
         if (consolidationCfg != null && !items.isEmpty() && embedding != null && !embedding.isEmpty()) {
             for (LongTermMemoryItem item : items) {
-                if (item.getEmbedding() != null && item.getEmbedding().size() == embedding.size()) {
-                    double sim = cosine(embedding, item.getEmbedding());
-                    if (sim >= consolidationCfg.getDedupThreshold()) {
-                        if (importance > item.getImportance()) {
-                            item.setImportance(importance);
-                        }
-                        item.setLastAccessed(LocalDateTime.now());
-                        return false;
+                List<Float> existEmbedding = item.getEmbedding();
+                if (existEmbedding == null || existEmbedding.size() != embedding.size()) {
+                    continue;
+                }
+                double sim = cosine(embedding, item.getEmbedding());
+                if (sim >= consolidationCfg.getDedupThreshold()) {
+                    // 保留更高的重要度
+                    if (importance > item.getImportance()) {
+                        item.setImportance(importance);
                     }
+                    // 更新访问时间
+                    item.setLastAccessed(LocalDateTime.now());
+                    return false;
                 }
             }
         }
 
+        // 2. 更新TF词典
         buildVocab(content);
+
+        // 3. 创建记忆
+        LocalDateTime now = LocalDateTime.now();
         LongTermMemoryItem item = LongTermMemoryItem.builder()
+                // TODO 已经由数据库生成syncLastItemPgId()，建议改成item.setId(null)
                 .id(nextId++)
                 .content(content)
                 .importance(importance)
                 .embedding(embedding)
+                .createdAt(now)
+                .lastAccessed(now)
                 .build();
         items.add(item);
         storeCount++;
@@ -105,6 +158,9 @@ public class LongTermMemory {
     /**
      * 从长期记忆中召回与 query 最相关的 topK 条
      * 优先使用 embedding 余弦相似度，若无 embedding 则退回 TF，只返回综合得分超过 threshold 的条目，避免注入噪声
+     *
+     * 综合得分：
+     * score = similarity * 0.7 + importance * 0.3
      * @param query
      * @param topK
      * @param queryEmbedding
@@ -117,33 +173,52 @@ public class LongTermMemory {
         // 综合得分阈值：sim*0.7 + importance*0.3
         final double threshold = 0.4;
 
-        List<double[]> scored = new ArrayList<>();
-        for (int i = 0; i < items.size(); i++) {
-            LongTermMemoryItem item = items.get(i);
+        List<ScoredItem> scoredItems = new ArrayList<>();
+//        List<double[]> scored = new ArrayList<>();
+        for (LongTermMemoryItem item : items) {
             double sim;
-            if (queryEmbedding != null && !queryEmbedding.isEmpty()
-                    && item.getEmbedding() != null && item.getEmbedding().size() == queryEmbedding.size()) {
+            // Embedding召回
+            if (CollectionUtils.isNotEmpty(queryEmbedding)
+                    && CollectionUtils.isNotEmpty(item.getEmbedding())
+                    && item.getEmbedding().size() == queryEmbedding.size()) {
                 sim = cosine(queryEmbedding, item.getEmbedding());
             } else {
-                buildVocab(query);
-                double[] qv = textToVector(query);
-                double[] iv = textToVector(item.getContent());
-                sim = cosineArr(qv, iv);
+                // TF降级召回
+                // 查询词不进入全局词表，防止查询词无限污染全局词表
+//                buildVocab(query);
+                List<Float> queryVector = textToVector(query);
+                List<Float> itemVector = textToVector(item.getContent());
+                int maxLength = Math.max(queryVector.size(), itemVector.size());
+
+                if (queryVector.size() < maxLength) {
+                    queryVector.add(0F);
+                }
+
+                if (itemVector.size() < maxLength) {
+                    itemVector.add(0F);
+                }
+                sim = cosine(queryVector, itemVector);
             }
-            double s = sim * 0.7 + item.getImportance() * 0.3;
-            if (s >= threshold) {
+            double score = sim * 0.7D + item.getImportance() * 0.3D;
+            if (score >= threshold) {
                 item.setLastAccessed(LocalDateTime.now());
-                scored.add(new double[]{i, s});
+                scoredItems.add(new ScoredItem(item, score));
             }
         }
-        if (scored.isEmpty()) return Collections.emptyList();
+        if (scoredItems.isEmpty()) {
+            return Collections.emptyList();
+        }
 
-        scored.sort((a, b) -> Double.compare(b[1], a[1]));
-        int limit = Math.min(topK, scored.size());
-        List<LongTermMemoryItem> result = new ArrayList<>();
+        scoredItems.sort(
+                Comparator.comparing(
+                        ScoredItem::getScore
+                ).reversed()
+        );
+        int limit = Math.min(topK, scoredItems.size());
+        List<LongTermMemoryItem> result = new ArrayList<>(limit);
         for (int i = 0; i < limit; i++) {
-            LongTermMemoryItem item = items.get((int) scored.get(i)[0]);
-            item.setScore(scored.get(i)[1]);
+            LongTermMemoryItem item = scoredItems.get(i).getItem();
+            item.setScore(scoredItems.get(i).getScore());
             result.add(item);
         }
         return result;
@@ -219,35 +294,6 @@ public class LongTermMemory {
         return result;
     }
 
-    public static class ConsolidationResult {
-        /**
-         * 去重删除的条目数
-         */
-        public int deduped;
-
-        /**
-         * 合并的条目数
-         */
-        public int merged;
-
-        /**
-         * 过期删除的条目数
-         */
-        public int expired;
-
-        /**
-         * 需要从 PG 删除的 ID 列表
-         */
-        public List<Long> deleteFromDB = new ArrayList<>();
-
-        /**
-         * 需要在 PG 更新的条目列表
-         */
-        public List<LongTermMemoryItem> updateInDB = new ArrayList<>();
-    }
-
-    // --- Private methods ---
-
     private void buildVocab(String text) {
         for (String t : tokenize(text)) {
             if (!vocabId.containsKey(t)) {
@@ -257,13 +303,16 @@ public class LongTermMemory {
         }
     }
 
-    private double[] textToVector(String text) {
-        double[] vec = new double[vocabId.size()];
+    private List<Float> textToVector(String text) {
+        List<Float> vector = new ArrayList<>(Collections.nCopies(vocabId.size(), 0F));
+
         for (String t : tokenize(text)) {
             Integer idx = vocabId.get(t);
-            if (idx != null) vec[idx]++;
+            if (idx != null) {
+                vector.set(idx, vector.get(idx) + 1);
+            }
         }
-        return vec;
+        return vector;
     }
 
     /**
@@ -272,7 +321,9 @@ public class LongTermMemory {
     private void rebuildVocab() {
         vocabId.clear();
         vocab.clear();
-        for (LongTermMemoryItem item : items) buildVocab(item.getContent());
+        for (LongTermMemoryItem item : items) {
+            buildVocab(item.getContent());
+        }
     }
 
     /**
@@ -288,7 +339,7 @@ public class LongTermMemory {
         }
         buildVocab(a.getContent());
         buildVocab(b.getContent());
-        return cosineArr(textToVector(a.getContent()), textToVector(b.getContent()));
+        return cosine(textToVector(a.getContent()), textToVector(b.getContent()));
     }
 
     /**
@@ -342,22 +393,26 @@ public class LongTermMemory {
     public static List<String> tokenize(String text) {
         List<String> tokens = new ArrayList<>();
         StringBuilder word = new StringBuilder();
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
+        for (char c : text.toCharArray()) {
             if (c >= 0x4E00 && c <= 0x9FFF) {
-                if (word.length() > 0) {
-                    tokens.add(word.toString().toLowerCase()); word.setLength(0);
+                // 中文字符
+                if (!word.isEmpty()) {
+                    tokens.add(word.toString().toLowerCase());
+                    word.setLength(0);
                 }
                 tokens.add(String.valueOf(c));
             } else if (Character.isLetterOrDigit(c)) {
+                // 英文数字
                 word.append(c);
             } else {
-                if (word.length() > 0) {
-                    tokens.add(word.toString().toLowerCase()); word.setLength(0);
+                // 分隔符
+                if (!word.isEmpty()) {
+                    tokens.add(word.toString().toLowerCase());
+                    word.setLength(0);
                 }
             }
         }
-        if (word.length() > 0) {
+        if (!word.isEmpty()) {
             tokens.add(word.toString().toLowerCase());
         }
         return tokens;
@@ -369,29 +424,53 @@ public class LongTermMemory {
      * @param b
      * @return
      */
-    public static float cosine(List<Float> a, List<Float> b) {
-        if (a.size() != b.size()) return 0;
-        float dot = 0, na = 0, nb = 0;
+    public static double cosine(List<Float> a, List<Float> b) {
+        if (a.size() != b.size()) {
+            return 0D;
+        }
+        double dot = 0D;
+        double normA = 0D;
+        double normB = 0D;
         for (int i = 0; i < a.size(); i++) {
             dot += a.get(i) * b.get(i);
-            na += a.get(i) * a.get(i);
-            nb += b.get(i) * b.get(i);
+            normA += a.get(i) * a.get(i);
+            normB += b.get(i) * b.get(i);
         }
-        if (na == 0 || nb == 0) return 0;
-        return (float) (dot / (Math.sqrt(na) * Math.sqrt(nb)));
+        if (normA == 0D || normB == 0D) {
+            return 0D;
+        }
+        return dot / (Math.sqrt(normA) * Math.sqrt(normB));
     }
 
-    private static double cosineArr(double[] a, double[] b) {
-        int len = Math.max(a.length, b.length);
-        double dot = 0, na = 0, nb = 0;
-        for (int i = 0; i < len; i++) {
-            double ai = i < a.length ? a[i] : 0;
-            double bi = i < b.length ? b[i] : 0;
-            dot += ai * bi;
-            na += ai * ai;
-            nb += bi * bi;
-        }
-        if (na == 0 || nb == 0) return 0;
-        return dot / (Math.sqrt(na) * Math.sqrt(nb));
+//    private static double cosineArr(double[] a, double[] b) {
+//        int len = Math.max(a.length, b.length);
+//        double dot = 0, na = 0, nb = 0;
+//        for (int i = 0; i < len; i++) {
+//            double ai = i < a.length ? a[i] : 0;
+//            double bi = i < b.length ? b[i] : 0;
+//            dot += ai * bi;
+//            na += ai * ai;
+//            nb += bi * bi;
+//        }
+//        if (na == 0 || nb == 0) return 0;
+//        return dot / (Math.sqrt(na) * Math.sqrt(nb));
+//    }
+
+    /**
+     * 召回阶段临时得分对象
+     */
+    @Data
+    @AllArgsConstructor
+    private static class ScoredItem {
+
+        /**
+         * 记忆条目
+         */
+        private LongTermMemoryItem item;
+
+        /**
+         * 综合得分
+         */
+        private Double score;
     }
 }

@@ -12,6 +12,7 @@ import java.util.List;
 
 /**
  * 短期记忆：近 N 轮对话滑动窗口
+ * TODO 后期改用redis
  */
 @Component
 @RequiredArgsConstructor
