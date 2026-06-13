@@ -1,7 +1,7 @@
 package com.zxl.agi.service.memory;
 
 import com.zxl.agi.config.AppConfig;
-import com.zxl.agi.model.MemoryItem;
+import com.zxl.agi.model.LongTermMemoryItem;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -14,10 +14,10 @@ import java.util.*;
 @Component
 public class LongTermMemory {
 
-    private final List<MemoryItem> items = Collections.synchronizedList(new ArrayList<>());
+    private final List<LongTermMemoryItem> items = Collections.synchronizedList(new ArrayList<>());
     private final Map<String, Integer> vocabId = new HashMap<>();
     private final List<String> vocab = new ArrayList<>();
-    private int nextId = 0;
+    private Long nextId = 0L;
     private int storeCount = 0;
     private AppConfig.ConsolidationConfig consolidationCfg;
 
@@ -25,7 +25,7 @@ public class LongTermMemory {
         this.consolidationCfg = cfg;
     }
 
-    public List<MemoryItem> getItems() { return new ArrayList<>(items); }
+    public List<LongTermMemoryItem> getItems() { return new ArrayList<>(items); }
 
     public int size() { return items.size(); }
 
@@ -39,7 +39,7 @@ public class LongTermMemory {
     public boolean store(String content, double importance, List<Float> embedding) {
         // 去重检测：与已有条目相似度过高时跳过，但更新已有条目的访问时间和重要性
         if (consolidationCfg != null && !items.isEmpty() && embedding != null && !embedding.isEmpty()) {
-            for (MemoryItem item : items) {
+            for (LongTermMemoryItem item : items) {
                 if (item.getEmbedding() != null && item.getEmbedding().size() == embedding.size()) {
                     double sim = cosine(embedding, item.getEmbedding());
                     if (sim >= consolidationCfg.getDedupThreshold()) {
@@ -54,7 +54,12 @@ public class LongTermMemory {
         }
 
         buildVocab(content);
-        MemoryItem item = new MemoryItem(nextId++, content, importance, embedding);
+        LongTermMemoryItem item = LongTermMemoryItem.builder()
+                .id(nextId++)
+                .content(content)
+                .importance(importance)
+                .embedding(embedding)
+                .build();
         items.add(item);
         storeCount++;
         return true;
@@ -64,9 +69,11 @@ public class LongTermMemory {
      * 插入已有 Item（用于从 DB 恢复数据）
      * @param item
      */
-    public void storeItem(MemoryItem item) {
+    public void storeItem(LongTermMemoryItem item) {
         buildVocab(item.getContent());
-        if (item.getId() >= nextId) nextId = item.getId() + 1;
+        if (item.getId() >= nextId) {
+            nextId = item.getId() + 1;
+        }
         if (item.getCreatedAt() == null) item.setCreatedAt(LocalDateTime.now());
         if (item.getLastAccessed() == null) item.setLastAccessed(item.getCreatedAt());
         items.add(item);
@@ -76,10 +83,12 @@ public class LongTermMemory {
      * 将最后一条记忆的 ID 同步为 PG 自增 ID
      * @param pgId
      */
-    public void syncLastItemPGID(int pgId) {
+    public void syncLastItemPGID(Long pgId) {
         if (!items.isEmpty() && pgId > 0) {
             items.get(items.size() - 1).setId(pgId);
-            if (pgId >= nextId) nextId = pgId + 1;
+            if (pgId >= nextId) {
+                nextId = pgId + 1;
+            }
         }
     }
 
@@ -101,14 +110,16 @@ public class LongTermMemory {
      * @param queryEmbedding
      * @return
      */
-    public List<MemoryItem> recall(String query, int topK, List<Float> queryEmbedding) {
-        if (items.isEmpty()) return Collections.emptyList();
+    public List<LongTermMemoryItem> recall(String query, int topK, List<Float> queryEmbedding) {
+        if (items.isEmpty()) {
+            return Collections.emptyList();
+        }
         // 综合得分阈值：sim*0.7 + importance*0.3
         final double threshold = 0.4;
 
         List<double[]> scored = new ArrayList<>();
         for (int i = 0; i < items.size(); i++) {
-            MemoryItem item = items.get(i);
+            LongTermMemoryItem item = items.get(i);
             double sim;
             if (queryEmbedding != null && !queryEmbedding.isEmpty()
                     && item.getEmbedding() != null && item.getEmbedding().size() == queryEmbedding.size()) {
@@ -129,9 +140,9 @@ public class LongTermMemory {
 
         scored.sort((a, b) -> Double.compare(b[1], a[1]));
         int limit = Math.min(topK, scored.size());
-        List<MemoryItem> result = new ArrayList<>();
+        List<LongTermMemoryItem> result = new ArrayList<>();
         for (int i = 0; i < limit; i++) {
-            MemoryItem item = items.get((int) scored.get(i)[0]);
+            LongTermMemoryItem item = items.get((int) scored.get(i)[0]);
             item.setScore(scored.get(i)[1]);
             result.add(item);
         }
@@ -150,7 +161,7 @@ public class LongTermMemory {
         Set<Integer> removed = new HashSet<>();
 
         // Phase 1: 重要性衰减 — 重要性随时间指数递减
-        for (MemoryItem item : items) {
+        for (LongTermMemoryItem item : items) {
             double days = ChronoUnit.HOURS.between(item.getCreatedAt(), LocalDateTime.now()) / 24.0;
             item.setImportance(item.getImportance() * Math.pow(consolidationCfg.getDecayRate(), days));
         }
@@ -174,7 +185,7 @@ public class LongTermMemory {
                     }
                 } else if (sim >= consolidationCfg.getSimilarityThreshold()) {
                     // 合并：语义相近但非完全重复，合并为一条
-                    MemoryItem merged = mergeItems(items.get(i), items.get(j));
+                    LongTermMemoryItem merged = mergeItems(items.get(i), items.get(j));
                     items.set(i, merged);
                     removed.add(j);
                     result.merged++;
@@ -198,7 +209,7 @@ public class LongTermMemory {
         }
 
         // 重建列表和词表
-        List<MemoryItem> newItems = new ArrayList<>();
+        List<LongTermMemoryItem> newItems = new ArrayList<>();
         for (int i = 0; i < items.size(); i++) {
             if (!removed.contains(i)) newItems.add(items.get(i));
         }
@@ -227,12 +238,12 @@ public class LongTermMemory {
         /**
          * 需要从 PG 删除的 ID 列表
          */
-        public List<Integer> deleteFromDB = new ArrayList<>();
+        public List<Long> deleteFromDB = new ArrayList<>();
 
         /**
          * 需要在 PG 更新的条目列表
          */
-        public List<MemoryItem> updateInDB = new ArrayList<>();
+        public List<LongTermMemoryItem> updateInDB = new ArrayList<>();
     }
 
     // --- Private methods ---
@@ -261,7 +272,7 @@ public class LongTermMemory {
     private void rebuildVocab() {
         vocabId.clear();
         vocab.clear();
-        for (MemoryItem item : items) buildVocab(item.getContent());
+        for (LongTermMemoryItem item : items) buildVocab(item.getContent());
     }
 
     /**
@@ -270,7 +281,7 @@ public class LongTermMemory {
      * @param b
      * @return
      */
-    private double itemSimilarity(MemoryItem a, MemoryItem b) {
+    private double itemSimilarity(LongTermMemoryItem a, LongTermMemoryItem b) {
         if (a.getEmbedding() != null && b.getEmbedding() != null
                 && !a.getEmbedding().isEmpty() && a.getEmbedding().size() == b.getEmbedding().size()) {
             return cosine(a.getEmbedding(), b.getEmbedding());
@@ -286,12 +297,12 @@ public class LongTermMemory {
      * @param b
      * @return
      */
-    private MemoryItem mergeItems(MemoryItem a, MemoryItem b) {
+    private LongTermMemoryItem mergeItems(LongTermMemoryItem a, LongTermMemoryItem b) {
         // 以重要性更高的条目为主体
-        MemoryItem base = a.getImportance() >= b.getImportance() ? a : b;
-        MemoryItem other = base == a ? b : a;
+        LongTermMemoryItem base = a.getImportance() >= b.getImportance() ? a : b;
+        LongTermMemoryItem other = base == a ? b : a;
 
-        MemoryItem merged = new MemoryItem();
+        LongTermMemoryItem merged = new LongTermMemoryItem();
         merged.setId(base.getId());
         merged.setImportance(Math.max(base.getImportance(), other.getImportance()));
         merged.setEmbedding(base.getEmbedding());

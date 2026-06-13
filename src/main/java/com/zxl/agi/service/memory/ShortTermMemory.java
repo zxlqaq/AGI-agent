@@ -1,6 +1,8 @@
 package com.zxl.agi.service.memory;
 
+import com.zxl.agi.config.AppConfig;
 import com.zxl.agi.model.ConversationMessage;
+import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
@@ -12,12 +14,11 @@ import java.util.List;
  * 短期记忆：近 N 轮对话滑动窗口
  */
 @Component
+@RequiredArgsConstructor
 public class ShortTermMemory {
+    private final AppConfig appConfig;
 
     private final List<ConversationMessage> messages = Collections.synchronizedList(new ArrayList<>());
-    private int maxTurns = 5;
-
-    public void setMaxTurns(int maxTurns) { this.maxTurns = maxTurns; }
 
     /**
      * 追加一条消息，超出窗口时自动丢弃最早记录
@@ -27,7 +28,7 @@ public class ShortTermMemory {
     public void add(String role, String content) {
         messages.add(new ConversationMessage(role, content,
                 LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))));
-        int max = maxTurns * 2;
+        int max = appConfig.getMemory().getShortTermMaxTurns() * 2;
         while (messages.size() > max) {
             messages.remove(0);
         }

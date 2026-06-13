@@ -1,6 +1,7 @@
 package com.zxl.agi.service.agent;
 
 import com.alibaba.fastjson.JSON;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.zxl.agi.config.AppConfig;
 import com.zxl.agi.dto.ChatRequest;
 import com.zxl.agi.dto.ChatResponse;
@@ -11,18 +12,22 @@ import com.zxl.agi.service.memory.LongTermMemory;
 import com.zxl.agi.service.memory.PreferenceMemory;
 import com.zxl.agi.service.memory.ShortTermMemory;
 import com.zxl.agi.service.rag.RagService;
-import com.zxl.agi.service.tools.ToolService;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.zxl.agi.service.tools.ToolDecider;
+import com.zxl.agi.service.tools.ToolRegistry;
 import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
 import okhttp3.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.util.CollectionUtils;
 
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -36,6 +41,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 5. Chat            — 直接与 LLM 对话
  */
 @Service
+@RequiredArgsConstructor
 public class UnifiedAgentService {
 
     private static final Logger log = LoggerFactory.getLogger(UnifiedAgentService.class);
@@ -45,42 +51,27 @@ public class UnifiedAgentService {
     private final AppConfig cfg;
     private final LlmService llm;
     private final RagService rag;
-    private final ToolService toolService;
+    private final ToolDecider toolDecider;
+    private final ToolRegistry toolRegistry;
     private final ShortTermMemory stm;
     private final LongTermMemory ltm;
     private final PreferenceMemory pref;
     private final InfrastructureService infra;
 
     private final Map<String, Tool> tools = new ConcurrentHashMap<>();
-    private final List<Snapshot> snapshots = Collections.synchronizedList(new ArrayList<>());
+    private final List<Snapshot> snapshots = new CopyOnWriteArrayList<>();
     private volatile TaskState currentTask;
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
 
-    public UnifiedAgentService(AppConfig cfg, LlmService llm, RagService rag, ToolService toolService,
-                               ShortTermMemory stm, LongTermMemory ltm, PreferenceMemory pref,
-                               InfrastructureService infra) {
-        this.cfg = cfg;
-        this.llm = llm;
-        this.rag = rag;
-        this.toolService = toolService;
-        this.stm = stm;
-        this.ltm = ltm;
-        this.pref = pref;
-        this.infra = infra;
-    }
-
     @PostConstruct
     public void init() {
-        // Configure STM
-        stm.setMaxTurns(cfg.getMemory().getShortTermMaxTurns());
-
-        // Configure LTM consolidation
+        // 配置长期记忆合并策略
         ltm.setConsolidationConfig(cfg.getMemory().getConsolidation());
 
         // Register default tools
-        tools.putAll(toolService.getDefaultTools());
+        tools.putAll(toolRegistry.getAllTools());
 
-        // Inject RAG callbacks
+        // 注入 RAG 的 LLM 合成回调（携带记忆上下文）
         rag.setGenerateFn((systemPrompt, userMsg) -> {
             String memPrefix = buildMemorySystemPrefix();
             String fullSystem = systemPrompt;
@@ -89,46 +80,80 @@ public class UnifiedAgentService {
             }
             return llm.chat(fullSystem, List.of(Map.of("role", "user", "content", userMsg)));
         });
-        rag.setEmbedFn(llm::embed);
 
-        // Init RAG infra
-        infra.initRAGInfra(cfg.getRag().getRagMilvusDim());
+        // 注入RAG向量化回调
+        rag.setEmbedFn(llm::embed);
 
         // 初始化 RAG 基础设施（Milvus collection + ES 索引）
         infra.initRagInfra(cfg.getRag().getRagMilvusDim());
 
-        // Register rag_search tool
-        tools.put("rag_search", new Tool("rag_search", "从私人黑洞（个人知识库）中检索相关文档内容",
-                List.of(new ToolParam("query", "string", "检索关键词或问题", true)),
-                params -> {
-                    String q = params.get("query") != null ? params.get("query").toString() : "相关内容";
-                    if (!rag.isLoaded()) throw new RuntimeException("知识库为空，请先在「私人黑洞」上传文档");
-                    return rag.query(q).answer;
-                }));
+        // 注册MCP工具
+        registerTool();
 
-        // Override search_web with Tavily + LLM fallback
-        tools.put("search_web", new Tool("search_web", "搜索互联网获取最新信息",
-                List.of(new ToolParam("query", "string", "搜索关键词", true)),
-                params -> {
-                    String q = params.get("query") != null ? params.get("query").toString() : "";
-                    if (q.isEmpty()) throw new RuntimeException("搜索关键词不能为空");
-                    // Try Tavily first
-                    if (cfg.getSearch().getApiKey() != null && !cfg.getSearch().getApiKey().isEmpty()) {
-                        try {
-                            return tavilySearch(q, cfg.getSearch().getApiKey(), cfg.getSearch().getApiUrl());
-                        } catch (Exception ignored) {}
-                    }
-                    // Fallback to LLM
-                    return llm.chat("你是一个知识丰富的搜索引擎助手。请基于你的知识，对用户的搜索问题给出准确、详细的回答。直接给出答案，不要说「我不知道」或「我无法搜索」。",
-                            List.of(Map.of("role", "user", "content", "搜索：" + q)));
-                }));
-
-        // Restore from DB
+        // 恢复记忆
         restoreFromDB();
+        // 恢复RAG
         restoreRAGFromDB();
 
         log.info("UnifiedAgent 初始化完成: {} 个工具, STM={}, LTM={}, Prefs={}",
                 tools.size(), stm.size(), ltm.size(), pref.getData().size());
+    }
+
+    private void registerTool() {
+        // 注册知识库检索工具
+        Tool ragTool = Tool.builder()
+                .name("rag_search")
+                .description("从私人黑洞（个人知识库）中检索相关文档内容")
+                .parameters(List.of(ToolParam.builder()
+                                .name("query")
+                                .type("string")
+                                .description("检索关键词或问题")
+                                .required(true)
+                                .build()))
+                .execute(params -> {
+                    String query = (String) params.getOrDefault("query", "相关内容");
+                    if (!rag.isLoaded()) {
+                        throw new RuntimeException("知识库为空，请先上传文档");
+                    }
+                    return rag.query(query).getAnswer();
+                })
+                .build();
+        toolRegistry.registerTool(ragTool);
+
+        // 注册互联网搜索工具
+        Tool tool = Tool.builder()
+                .name("search_web")
+                .description("搜索互联网获取最新信息")
+                .parameters(List.of(ToolParam.builder()
+                                .name("query")
+                                .type("string")
+                                .description("搜索关键词")
+                                .required(true)
+                                .build()))
+                .execute(params -> {
+                    String query = (String) params.get("query");
+                    if (query == null || query.isBlank()) {
+                        throw new RuntimeException("搜索关键词不能为空");
+                    }
+                    // 优先尝试 Tavily 真实搜索
+                    if (cfg.getSearch().getApiKey() != null && !cfg.getSearch().getApiKey().isEmpty()) {
+                        try {
+                            return tavilySearch(query, cfg.getSearch().getApiKey(), cfg.getSearch().getApiUrl());
+                        } catch (Exception ignored) {}
+                    }
+
+                    return llm.chat("你是一个知识丰富的搜索引擎助手。 请基于你的知识回答用户问题。",
+                            List.of(Map.of("role", "user", "content", "搜索：" + query))
+//                            List.of(
+//                                    new Message(
+//                                            "user",
+//                                            "搜索：" + query
+//                                    )
+//                            )
+                    );
+                })
+                .build();
+        toolRegistry.registerTool(tool);
     }
 
     // ===== Public API =====
@@ -143,39 +168,60 @@ public class UnifiedAgentService {
         resp.setQuery(query);
         resp.setMode("chat");
 
+        // ==========================
+        // 1. STM
+        // ==========================
         // 更新短期记忆
         stm.add("user", query);
-
         // 持久化用户消息到 PG
         infra.saveChatHistory("user", query);
 
+        // ==========================
+        // 2. 偏好提取（异步）
+        // ==========================
         // 偏好提取：优先 LLM，降级规则
-        new Thread(() -> {
-            Map<String, String> kvs = llm.extractPreferences(query);
-            if (kvs != null && !kvs.isEmpty()) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                Map<String, String> kvs = llm.extractPreferences(query);
+                if (kvs == null || kvs.isEmpty()) {
+                    return;
+                }
+
                 pref.saveBatch(kvs);
-                for (Map.Entry<String, String> e : kvs.entrySet()) {
-                    infra.savePreference("default", e.getKey(), e.getValue());
-                    String content = "用户" + e.getKey() + ": " + e.getValue();
-                    List<Float> emb = llm.embed(content);
-                    if (ltm.store(content, 0.8, emb)) {
-                        String embJson = "null";
-                        try { if (emb != null) embJson = mapper.writeValueAsString(emb); } catch (Exception ignored) {}
-                        int pgId = infra.saveLongTermItem(content, 0.8, embJson);
+                for (Map.Entry<String, String> entry : kvs.entrySet()) {
+                    String key = entry.getKey();
+                    String value = entry.getValue();
+                    infra.savePreference("default", key, value);
+                    String content = String.format("用户%s: %s", key, value);
+                    List<Float> embedding = llm.embed(content);
+                    boolean stored = ltm.store(content, 0.8D, embedding);
+                    if (stored) {
+                        String embJson = mapper.writeValueAsString(embedding);
+                        Long pgId = infra.saveLongTermItem(content, 0.8D, embJson);
                         ltm.syncLastItemPGID(pgId);
                     }
                 }
+            } catch (Exception e) {
+                log.warn("偏好提取失败: {}", e.getMessage());
             }
-        }).start();
+        });
 
+        // ==========================
+        // 3. 规则偏好提取
+        // ==========================
         // 同步规则提取（用于立即展示 ExtractedInfo）
+        // TODO 返回结果封装
         String[] extracted = pref.extractAndSave(query);
         if (extracted != null) {
-            resp.setExtractedInfo("已记住：" + extracted[0] + " = " + extracted[1]);
+            resp.setExtractedInfo(String.format("已记住：%s = %s", extracted[0], extracted[1]));
         }
 
+        // ==========================
+        // 4. 构建记忆上下文
+        // ==========================
         // 构建所有模式共享的记忆增强层
         String memPrefix = buildMemorySystemPrefixWithCtx(query);
+        // 构建历史消息
         List<Map<String, String>> histMsgs = buildHistoryMessages(query);
 
         // 检查 context 是否已取消
@@ -185,77 +231,156 @@ public class UnifiedAgentService {
             return resp;
         }
 
-        // 路由（记忆已注入，不再是独立分支）
+        // ==========================
+        // 5. 路由
+        // ==========================
         if (req.isExplicit()) {
-            if (req.getSelectedTools() != null && !req.getSelectedTools().isEmpty()) {
-                Map<String, Tool> filtered = filterTools(req.getSelectedTools());
-                // 只要工具集非空就走 ReAct，保证每次工具调用都有完整推理轨迹
-                if (!filtered.isEmpty()) {
-                    resp.setMode("react");
-                    runReActWithTools(resp, query, filtered, memPrefix, histMsgs);
-                } else {
-                    resp.setMode("tool");
-                    runToolFromSet(resp, query, tools, memPrefix, histMsgs);
-                }
-            } else if (req.isUseRag() && rag.isLoaded()) {
-                resp.setMode("rag");
-                RagService.QueryResult qr = rag.query(query);
-                resp.setAnswer(qr.answer);
-                resp.setSearchResults(toSearchResults(qr.results));
-            } else {
-                resp.setMode("chat");
-                String sp = buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。");
-                resp.setAnswer(llm.chat(sp, histMsgs));
-            }
+            processExplicitRoute(resp, query, req, memPrefix, histMsgs);
+//            if (req.getSelectedTools() != null && !req.getSelectedTools().isEmpty()) {
+//                Map<String, Tool> filtered = filterTools(req.getSelectedTools());
+//                // 只要工具集非空就走 ReAct，保证每次工具调用都有完整推理轨迹
+//                if (!filtered.isEmpty()) {
+//                    resp.setMode("react");
+//                    runReActWithTools(resp, query, filtered, memPrefix, histMsgs);
+//                } else {
+//                    resp.setMode("tool");
+//                    runToolFromSet(resp, query, tools, memPrefix, histMsgs);
+//                }
+//            } else if (req.isUseRag() && rag.isLoaded()) {
+//                resp.setMode("rag");
+//                RagService.QueryResult qr = rag.query(query);
+//                resp.setAnswer(qr.answer);
+//                resp.setSearchResults(toSearchResults(qr.results));
+//            } else {
+//                resp.setMode("chat");
+//                String sp = buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。");
+//                resp.setAnswer(llm.chat(sp, histMsgs));
+//            }
         } else {
             // Auto routing
-            if (needReAct(query)) {
-                resp.setMode("react");
-                runReActWithTools(resp, query, tools, memPrefix, histMsgs);
-            } else if (needTool(query)) {
-                resp.setMode("tool");
-                runToolFromSet(resp, query, tools, memPrefix, histMsgs);
-            } else if (needRAG(query)) {
-                resp.setMode("rag");
-                RagService.QueryResult qr = rag.query(query);
-                resp.setAnswer(qr.answer);
-                resp.setSearchResults(toSearchResults(qr.results));
-            } else {
-                resp.setMode("chat");
-                String sp = buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。");
-                resp.setAnswer(llm.chat(sp, histMsgs));
-            }
+            processAutoRoute(resp, query, memPrefix, histMsgs);
+//            if (needReAct(query)) {
+//                resp.setMode("react");
+//                runReActWithTools(resp, query, tools, memPrefix, histMsgs);
+//            } else if (needTool(query)) {
+//                resp.setMode("tool");
+//                runToolFromSet(resp, query, tools, memPrefix, histMsgs);
+//            } else if (needRAG(query)) {
+//                resp.setMode("rag");
+//                RagService.QueryResult qr = rag.query(query);
+//                resp.setAnswer(qr.answer);
+//                resp.setSearchResults(toSearchResults(qr.results));
+//            } else {
+//                resp.setMode("chat");
+//                String sp = buildSystemPrompt(memPrefix, "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。");
+//                resp.setAnswer(llm.chat(sp, histMsgs));
+//            }
         }
 
         // 检查是否被中断
         if (cancelled.get()) resp.setInterrupted(true);
 
-        // 从llm回答中提取可记忆信息
+        // ==========================
+        // 6. Assistant消息落库
+        // ==========================
         stm.add("assistant", resp.getAnswer());
         infra.saveChatHistory("assistant", resp.getAnswer());
 
-        // 从llm回答中提取可记忆信息
-        final String answer = resp.getAnswer();
-        new Thread(() -> extractMemoryFromReply(answer)).start();
+        // ==========================
+        // 7. 从回复提取长期记忆
+        // =
+        CompletableFuture.runAsync(() ->
+                extractMemoryFromReply(resp.getAnswer()));
 
-        // 异步触发记忆合并（去重+合并+衰减+过期）
-        new Thread(() -> {
-            if (ltm.needConsolidation()) {
-                LongTermMemory.ConsolidationResult result = ltm.consolidate();
-                syncConsolidationToDB(result);
+        // ==========================
+        // 8. 异步触发记忆合并（去重+合并+衰减+过期）
+        // ==========================
+        CompletableFuture.runAsync(() -> {
+            try {
+                if (ltm.needConsolidation()) {
+                    LongTermMemory.ConsolidationResult result = ltm.consolidate();
+                    syncConsolidationToDB(result);
+                }
+            } catch (Exception e) {
+                log.warn("长期记忆合并失败: {}", e.getMessage());
             }
-        }).start();
+        });
 
-        // Publish event
+        // ==========================
+        // 9. 发布事件
+        // ==========================
         try {
             String eventData = mapper.writeValueAsString(Map.of("query", query, "mode", resp.getMode()));
             infra.publishEvent("agent.chat", eventData);
         } catch (Exception ignored) {}
 
+        // ==========================
+        // 10. 统计信息
+        // ==========================
         resp.setShortTermCount(stm.size());
         resp.setLongTermCount(ltm.size());
         resp.setPreferences(pref.getData());
         return resp;
+    }
+
+    private void processExplicitRoute(ChatResponse response, String query,
+            ChatRequest request, String memoryPrefix, List<Map<String, String>> historyMessages) {
+        if (!CollectionUtils.isEmpty(request.getSelectedTools())) {
+            Map<String, Tool> selectedTools = toolRegistry.getTools(request.getSelectedTools());
+            // 只要工具集非空就走 ReAct，保证每次工具调用都有完整推理轨迹
+            if (!selectedTools.isEmpty()) {
+                response.setMode("react");
+                runReActWithTools(response, query, selectedTools, memoryPrefix, historyMessages);
+                return;
+            }
+
+            response.setMode("tool");
+            runToolFromSet(response, query, selectedTools, memoryPrefix, historyMessages);
+            return;
+        }
+
+        if (request.isUseRag() && rag.isLoaded()) {
+            response.setMode("rag");
+            RagQueryResult ragResult = rag.query(query);
+            response.setAnswer(ragResult.getAnswer());
+            response.setSearchResults(ragResult.getResults());
+            return;
+        }
+
+        response.setMode("chat");
+        String systemPrompt = buildSystemPrompt(memoryPrefix,
+                "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。");
+        String answer = llm.chat(systemPrompt, historyMessages);
+        response.setAnswer(answer);
+    }
+
+    private void processAutoRoute(ChatResponse response, String query,
+            String memoryPrefix, List<Map<String, String>> historyMessages) {
+        if (needReAct(query)) {
+            response.setMode("react");
+            runReActWithTools(response, query, toolRegistry.getAllTools(), memoryPrefix, historyMessages);
+            return;
+        }
+
+        if (needTool(query)) {
+            response.setMode("tool");
+            runToolFromSet(response, query, toolRegistry.getAllTools(), memoryPrefix, historyMessages);
+            return;
+        }
+
+        if (needRAG(query)) {
+            response.setMode("rag");
+            RagQueryResult ragResult = rag.query(query);
+            response.setAnswer(ragResult.getAnswer());
+            response.setSearchResults(ragResult.getResults());
+            return;
+        }
+
+        response.setMode("chat");
+        String systemPrompt = buildSystemPrompt(memoryPrefix,
+                "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。");
+        String answer = llm.chat(systemPrompt, historyMessages);
+        response.setAnswer(answer);
     }
 
     public void cancel() { cancelled.set(true); }
@@ -312,17 +437,20 @@ public class UnifiedAgentService {
 
     private void runToolFromSet(ChatResponse resp, String query, Map<String, Tool> ts,
                                 String memPrefix, List<Map<String, String>> histMsgs) {
-        ToolCallResult tc = toolService.decide(query, ts);
+        ToolCallResult tc = toolDecider.decide(query, ts);
         if (tc == null) { resp.setAnswer("我无法处理这个请求。"); return; }
 
         Tool tool = ts.get(tc.getToolName());
-        if (tool == null) { resp.setAnswer("工具 " + tc.getToolName() + " 不存在"); resp.setToolCall(tc); return; }
+        if (tool == null) {
+            resp.setAnswer("工具 " + tc.getToolName() + " 不存在"); resp.setToolCall(tc);
+            return;
+        }
 
         // 偏好感知参数自动填充
         fillParamsFromPreference(tc);
 
         try {
-            String result = tool.getExecute().apply(tc.getParams());
+            String result = tool.getExecute().execute(tc.getParams());
             tc.setToolResult(result);
         } catch (Exception e) {
             resp.setAnswer("工具执行失败: " + e.getMessage());
@@ -385,6 +513,7 @@ public class UnifiedAgentService {
                 // 生成中断摘要
                 String msg = buildInterruptMessage(currentTask);
                 reactSteps.add(new ReActStep(ReActStep.OBSERVATION, "[已中断] " + msg));
+
                 saveSnapshot();
                 resp.setAnswer("[已中断] " + msg);
                 resp.setSteps(reactSteps);
@@ -458,7 +587,9 @@ public class UnifiedAgentService {
      * @return
      */
     private List<PlanItem> llmPlanSteps(String query, Map<String, Tool> ts, String memPrefix) {
-        if (!cfg.isRealLLM()) return rulePlanItems(query, ts);
+        if (!cfg.isRealLLM()) {
+            return rulePlanItems(query, ts);
+        }
 
         // 构造工具描述
         StringBuilder toolLines = new StringBuilder();
@@ -468,13 +599,15 @@ public class UnifiedAgentService {
             StringBuilder pDescs = new StringBuilder();
             if (t.getParameters() != null) {
                 for (ToolParam p : t.getParameters()) {
-                    if (pDescs.length() > 0) pDescs.append(", ");
+                    if (!pDescs.isEmpty()) {
+                        pDescs.append(", ");
+                    }
                     pDescs.append(p.getName()).append("(").append(p.getType()).append(")");
-                    if (p.isRequired()) pDescs.append("（必填）");
+                    if (p.getRequired()) pDescs.append("（必填）");
                 }
             }
             toolLines.append("- ").append(name).append(": ").append(t.getDescription())
-                    .append(" [参数: ").append(pDescs.length() > 0 ? pDescs : "无参数").append("]\n");
+                    .append(" [参数: ").append(!pDescs.isEmpty() ? pDescs : "无参数").append("]\n");
         }
 
         String planPrompt = String.format("""
@@ -495,6 +628,10 @@ public class UnifiedAgentService {
         }
 
         String raw = llm.chat(plannerBase, List.of(Map.of("role", "user", "content", planPrompt)));
+        if (cancelled.get()) {
+            return rulePlanItems(query, tools);
+        }
+
         // 清洗 LLM 输出（可能包含 markdown 代码块）
         raw = raw.trim()
                 .replace("```json", "")
@@ -532,31 +669,41 @@ public class UnifiedAgentService {
         String q = query.toLowerCase();
         List<PlanItem> items = new ArrayList<>();
 
-        if (ts.containsKey("get_time") && (q.contains("时间") || q.contains("几点") || q.contains("现在"))) {
+        if (ts.containsKey("get_time")
+                && (q.contains("时间") || q.contains("几点") || q.contains("现在"))) {
             Map<String, String> params = new HashMap<>();
-            if (q.contains("北京")) params.put("timezone", "Asia/Shanghai");
+            if (q.contains("北京")) {
+                params.put("timezone", "Asia/Shanghai");
+            }
             items.add(new PlanItem("get_time", params, "查询当前时间"));
         }
+
         if (ts.containsKey("get_weather") && q.contains("天气")) {
             String city = "北京";
             for (String c : List.of("东京", "北京", "上海", "广州", "深圳", "纽约", "伦敦")) {
-                if (q.contains(c)) { city = c; break; }
+                if (q.contains(c)) {
+                    city = c;
+                    break;
+                }
             }
             items.add(new PlanItem("get_weather", Map.of("city", city), "查询" + city + "天气"));
         }
-        if (ts.containsKey("search_web") && (q.contains("搜索") || q.contains("查询") || q.contains("介绍")
+
+        if (ts.containsKey("search_web")
+                && (q.contains("搜索") || q.contains("查询") || q.contains("介绍")
                 || q.contains("是什么") || q.contains("怎么") || q.contains("如何"))) {
             items.add(new PlanItem("search_web", Map.of("query", query), "搜索相关信息"));
         }
+
         if (ts.containsKey("rag_search")) {
             items.add(new PlanItem("rag_search", Map.of("query", query), "检索个人知识库"));
         }
+
         // MCP拓展工具
         // 内置工具集合
-        Set<String> builtins = new HashSet<>(Arrays.asList("get_time", "get_weather", "search_web", "rag_search"));
+        Set<String> builtins = Set.of("get_time", "get_weather", "search_web", "rag_search");
         for (Map.Entry<String, Tool> entry : ts.entrySet()) {
             String name = entry.getKey();
-            Tool t = entry.getValue();
             if (builtins.contains(name)) {
                 continue;
             }
@@ -584,7 +731,7 @@ public class UnifiedAgentService {
         // 如果不是真实的LLM环境，用query填充首个必填参数
         if (!cfg.isRealLLM()) {
             for (ToolParam p : t.getParameters()) {
-                if (p.isRequired()) {
+                if (p.getRequired()) {
                     result.put(p.getName(), query);
                     break;
                 }
@@ -595,7 +742,7 @@ public class UnifiedAgentService {
         // 构建参数说明
         List<String> lines = new ArrayList<>();
         for (ToolParam p : t.getParameters()) {
-            String req = p.isRequired() ? "（必填）" : "";
+            String req = p.getRequired() ? "（必填）" : "";
             lines.add(String.format("- %s (%s)%s: %s", p.getName(), p.getType(), req, p.getDescription()));
         }
 
@@ -617,7 +764,7 @@ public class UnifiedAgentService {
             // LLM输出无法解析时兜底：用query填充首个必填参数
             result.clear();
             for (ToolParam p : t.getParameters()) {
-                if (p.isRequired()) {
+                if (p.getRequired()) {
                     result.put(p.getName(), query);
                     break;
                 }
@@ -679,16 +826,23 @@ public class UnifiedAgentService {
         if (step.getParams() != null) step.getParams().forEach(params::put);
 
         for (int attempt = 0; attempt < cfg.getHarness().getMaxRetries(); attempt++) {
-            if (cancelled.get()) { step.setError("被用户中断"); return false; }
+            if (cancelled.get()) {
+                step.setError("被用户中断");
+                return false;
+            }
             try {
-                String result = tool.getExecute().apply(params);
+                String result = tool.getExecute().execute(params);
                 step.setResult(result);
                 return true;
             } catch (Exception e) {
                 step.setRetryCount(attempt + 1);
                 step.setError(e.getMessage());
                 if (cancelled.get()) { step.setError("被用户中断"); return false; }
-                try { Thread.sleep(cfg.getHarness().getRetryDelayMs()); } catch (InterruptedException ignored) {}
+                try {
+                    Thread.sleep(cfg.getHarness().getRetryDelayMs());
+                } catch (InterruptedException ignored) {
+
+                }
             }
         }
         return false;
@@ -704,13 +858,18 @@ public class UnifiedAgentService {
     private String buildMemorySystemPrefix() {
         List<String> parts = new ArrayList<>();
         String prefCtx = pref.buildContext();
-        if (!prefCtx.isEmpty()) parts.add(prefCtx);
-        List<MemoryItem> ltmItems = ltm.getItems();
+        if (!prefCtx.isEmpty()) {
+            parts.add(prefCtx);
+        }
+
+        List<LongTermMemoryItem> ltmItems = ltm.getItems();
         if (!ltmItems.isEmpty()) {
-            List<String> contents = ltmItems.stream().map(MemoryItem::getContent).toList();
+            List<String> contents = ltmItems.stream()
+                    .map(LongTermMemoryItem::getContent)
+                    .toList();
             parts.add("【长期记忆】\n" + String.join("\n", contents));
         }
-        return String.join("\n\n", parts);
+        return parts.isEmpty() ? "" : String.join("\n\n", parts);
     }
 
     /**
@@ -721,16 +880,36 @@ public class UnifiedAgentService {
      */
     private String buildMemorySystemPrefixWithCtx(String query) {
         List<String> parts = new ArrayList<>();
+        // 用户偏好上下文
         String prefCtx = pref.buildContext();
-        if (!prefCtx.isEmpty()) parts.add(prefCtx);
-
-        List<Float> queryEmb = llm.embed(query);
-        List<MemoryItem> recalled = ltm.recall(query, cfg.getMemory().getLongTermTopK(), queryEmb);
-        if (!recalled.isEmpty()) {
-            List<String> contents = recalled.stream().map(MemoryItem::getContent).toList();
-            parts.add("【相关记忆】\n" + String.join("\n", contents));
+        if (!prefCtx.isEmpty()) {
+            parts.add(prefCtx);
         }
-        return String.join("\n\n", parts);
+
+        try {
+            // 查询向量化
+            List<Float> queryEmbedding = llm.embed(query);
+            if (cancelled.get()) {
+                return String.join("\n\n", parts);
+            }
+
+            // 长期记忆召回
+            List<LongTermMemoryItem> items = ltm.recall(query, cfg.getMemory().getLongTermTopK(), queryEmbedding);
+
+            if (!CollectionUtils.isEmpty(items)) {
+                StringBuilder memoryBuilder = new StringBuilder("【相关记忆】\n");
+                for (LongTermMemoryItem item : items) {
+                    memoryBuilder
+                            .append(item.getContent())
+                            .append("\n");
+                }
+                parts.add(memoryBuilder.toString());
+            }
+        } catch (Exception e) {
+            log.warn("长期记忆召回失败: {}", e.getMessage());
+        }
+
+        return parts.isEmpty() ? "" : String.join("\n\n", parts);
     }
 
     /**
@@ -739,18 +918,19 @@ public class UnifiedAgentService {
      * @return
      */
     private List<Map<String, String>> buildHistoryMessages(String query) {
-        List<Map<String, String>> msgs = new ArrayList<>();
+        List<Map<String, String>> messages = new ArrayList<>();
         // STM 最后一条是刚加入的 user query，跳过重复
         for (ConversationMessage m : stm.getMessages()) {
             if ("user".equals(m.getRole()) || "assistant".equals(m.getRole())) {
-                msgs.add(Map.of("role", m.getRole(), "content", m.getContent()));
+                // TODO ChatMessage
+                messages.add(Map.of("role", m.getRole(), "content", m.getContent()));
             }
         }
         // 如果最后一条不是当前 query（初次调用时 STM 已包含），则附上
-        if (msgs.isEmpty() || !msgs.get(msgs.size() - 1).get("content").equals(query)) {
-            msgs.add(Map.of("role", "user", "content", query));
+        if (messages.isEmpty() || !query.equals(messages.get(messages.size() - 1).get("content"))) {
+            messages.add(Map.of("role", "user", "content", query));
         }
-        return msgs;
+        return messages;
     }
 
     /**
@@ -812,7 +992,7 @@ public class UnifiedAgentService {
                 if (ltm.store(content, 0.7, emb)) {
                     String embJson = "null";
                     try { if (emb != null) embJson = mapper.writeValueAsString(emb); } catch (Exception ignored) {}
-                    int pgId = infra.saveLongTermItem(content, 0.7, embJson);
+                    Long pgId = infra.saveLongTermItem(content, 0.7, embJson);
                     ltm.syncLastItemPGID(pgId);
                 }
                 log.info("🧠 从回复中提取记忆：{} = {}", e.getKey(), e.getValue());
@@ -830,9 +1010,15 @@ public class UnifiedAgentService {
             log.info("🧹 记忆合并：删除 {} 条（去重={}, 合并={}, 过期={}）",
                     result.deduped + result.merged + result.expired, result.deduped, result.merged, result.expired);
         }
-        for (MemoryItem item : result.updateInDB) {
+        for (LongTermMemoryItem item : result.updateInDB) {
             String embJson = "null";
-            try { if (item.getEmbedding() != null) embJson = mapper.writeValueAsString(item.getEmbedding()); } catch (Exception ignored) {}
+            try {
+                if (item.getEmbedding() != null) {
+                embJson = mapper.writeValueAsString(item.getEmbedding());
+                }
+            } catch (Exception ignored) {
+
+            }
             infra.updateLongTermItem(item.getId(), item.getContent(), item.getImportance(), embJson);
             log.info("🔗 记忆合并：更新 id={}", item.getId());
         }
@@ -849,13 +1035,19 @@ public class UnifiedAgentService {
         pref.saveBatch(prefs);
 
         // 恢复长期记忆
-        List<InfrastructureService.LongTermRow> rows = infra.loadLongTermItems();
-        for (InfrastructureService.LongTermRow row : rows) {
-            MemoryItem item = new MemoryItem();
-            item.setId(row.id); item.setContent(row.content); item.setImportance(row.importance);
-            item.setEmbedding(row.embedding);
-            if (row.createdAt != null) item.setCreatedAt(row.createdAt.toLocalDateTime());
-            if (row.lastAccessed != null) item.setLastAccessed(row.lastAccessed.toLocalDateTime());
+        List<LongTermMemoryItem> rows = infra.loadLongTermItems();
+        for (LongTermMemoryItem row : rows) {
+            LongTermMemoryItem item = new LongTermMemoryItem();
+            item.setId(row.getId());
+            item.setContent(row.getContent());
+            item.setImportance(row.getImportance());
+            item.setEmbedding(row.getEmbedding());
+            if (row.getCreatedAt() != null) {
+                item.setCreatedAt(row.getCreatedAt());
+            }
+            if (row.getLastAccessed() != null) {
+                item.setLastAccessed(row.getLastAccessed());
+            }
             ltm.storeItem(item);
         }
 
@@ -876,7 +1068,9 @@ public class UnifiedAgentService {
      */
     private void restoreRAGFromDB() {
         List<Chunk> chunkRows = infra.loadAllRAGChunks();
-        if (chunkRows.isEmpty()) return;
+        if (chunkRows.isEmpty()) {
+            return;
+        }
         List<Chunk> chunks = new ArrayList<>();
         for (int i = 0; i < chunkRows.size(); i++) {
             chunks.add(new Chunk((long) i, chunkRows.get(i).getContent()));
@@ -893,7 +1087,9 @@ public class UnifiedAgentService {
     private Map<String, Tool> filterTools(List<String> names) {
         Map<String, Tool> result = new HashMap<>();
         for (String name : names) {
-            if (tools.containsKey(name)) result.put(name, tools.get(name));
+            if (tools.containsKey(name)) {
+                result.put(name, tools.get(name));
+            }
         }
         return result;
     }
@@ -935,12 +1131,12 @@ public class UnifiedAgentService {
         return msg.toString();
     }
 
-    private List<ChatResponse.SearchResultDto> toSearchResults(List<RagService.ScoredChunk> results) {
-        if (results == null) return null;
-        return results.stream()
-                .map(r -> new ChatResponse.SearchResultDto(r.chunk, r.score))
-                .toList();
-    }
+//    private List<ChatResponse.SearchResultDto> toSearchResults(List<RagService.ScoredChunk> results) {
+//        if (results == null) return null;
+//        return results.stream()
+//                .map(r -> new ChatResponse.SearchResultDto(r.chunk, r.score))
+//                .toList();
+//    }
 
     /**
      * 调用 Tavily Search API，返回格式化的搜索结果摘要

@@ -4,6 +4,8 @@ import com.zxl.agi.config.AppConfig;
 import com.zxl.agi.infrastructure.InfrastructureService;
 import com.zxl.agi.model.Chunk;
 import com.zxl.agi.model.HybridResult;
+import com.zxl.agi.model.RagQueryResult;
+import com.zxl.agi.model.SearchResult;
 import com.zxl.agi.service.memory.LongTermMemory;
 import lombok.Getter;
 import lombok.Setter;
@@ -87,40 +89,48 @@ public class RagService {
     /**
      * Query the knowledge base and return (answer, searchResults)
      */
-    public QueryResult query(String question) {
+    public RagQueryResult query(String question) {
         if (!loaded) {
-            return new QueryResult("知识库为空，请先上传文档。", Collections.emptyList());
+            return new RagQueryResult("知识库为空，请先上传文档。", Collections.emptyList());
         }
 
         // TF-based search (fallback when Milvus/ES unavailable)
 //        List<ScoredChunk> results = tfSearch(question, cfg.getRag().getTopK());
         List<HybridResult> hybridResults = store.search(question, cfg.getRag().getTopK());
         if (hybridResults.isEmpty()) {
-            return new QueryResult("知识库中未找到相关内容。", Collections.emptyList());
+            return new RagQueryResult("知识库中未找到相关内容。", Collections.emptyList());
         }
 
-        List<ScoredChunk> results = hybridResults.stream()
-                .map(hr -> new ScoredChunk(
-                        hr.getChunk(),
-                        hr.getScore()
-                ))
+        List<SearchResult> results = hybridResults.stream()
+                .map(hr -> new SearchResult(hr.getChunk(), hr.getScore()))
                 .toList();
 
         String context = results.stream()
-                .map(r -> r.chunk.getContent())
-                .filter(s -> s != null && !s.isBlank())
+                .map(SearchResult::getChunk)
+                .filter(Objects::nonNull)
+                .map(Chunk::getContent)
+                .filter(content -> content != null && !content.isBlank())
                 .collect(Collectors.joining("\n\n"));
 
-        String answer;
-        if (generateFn != null) {
-            String systemPrompt = "你是一个基于知识库回答问题的助手。请仅根据提供的上下文内容回答问题，不要编造信息。如果上下文不足以回答，请说明。";
-            String userMsg = String.format("上下文：\n%s\n\n问题：%s", context, question);
-            answer = generateFn.apply(systemPrompt, userMsg);
-        } else {
-            answer = "【知识库检索结果】\n" + context;
+        // 未命中知识库
+        if (context.isBlank()) {
+            return new RagQueryResult("知识库中未命中！", results);
         }
 
-        return new QueryResult(answer, results);
+        if (generateFn != null) {
+            String systemPrompt = "你是一个基于知识库回答问题的助手。" +
+                    "请仅根据提供的上下文内容回答问题，不要编造信息。" +
+                    "如果上下文不足以回答，请说明。";
+            String userMsg = String.format("上下文：\n%s\n\n问题：%s", context, question);
+            String answer = generateFn.apply(systemPrompt, userMsg);
+            return new RagQueryResult(
+                    answer,
+                    results
+            );
+        }
+
+        // 无LLM时直接返回原文
+        return new RagQueryResult("【知识库检索结果】\n" + context, results);
     }
 
     /**
@@ -149,7 +159,7 @@ public class RagService {
 
     // ===== TF-based search (fallback) =====
 
-    private List<ScoredChunk> tfSearch(String query, int topK) {
+    private List<SearchResult> tfSearch(String query, int topK) {
         if (indexedChunks.isEmpty()) return Collections.emptyList();
 
         // Build vocab
@@ -171,7 +181,7 @@ public class RagService {
         }
 
         // Score chunks
-        List<ScoredChunk> scored = new ArrayList<>();
+        List<SearchResult> scored = new ArrayList<>();
         for (Chunk chunk : indexedChunks) {
             double[] cVec = new double[vocabList.size()];
             for (String t : LongTermMemory.tokenize(chunk.getContent())) {
@@ -179,10 +189,10 @@ public class RagService {
                 if (idx != null) cVec[idx]++;
             }
             double sim = cosine(qVec, cVec);
-            if (sim > 0) scored.add(new ScoredChunk(chunk, sim));
+            if (sim > 0) scored.add(new SearchResult(chunk, sim));
         }
 
-        scored.sort((a, b) -> Double.compare(b.score, a.score));
+        scored.sort((a, b) -> Double.compare(b.getSimilarity(), a.getSimilarity()));
         return scored.subList(0, Math.min(topK, scored.size()));
     }
 
@@ -197,17 +207,17 @@ public class RagService {
 
     // ===== Result types =====
 
-    public static class ScoredChunk {
-        public Chunk chunk;
-        public double score;
-        public ScoredChunk(Chunk chunk, double score) { this.chunk = chunk; this.score = score; }
-    }
-
-    public static class QueryResult {
-        public String answer;
-        public List<ScoredChunk> results;
-        public QueryResult(String answer, List<ScoredChunk> results) {
-            this.answer = answer; this.results = results;
-        }
-    }
+//    public static class ScoredChunk {
+//        public Chunk chunk;
+//        public double score;
+//        public ScoredChunk(Chunk chunk, double score) { this.chunk = chunk; this.score = score; }
+//    }
+//
+//    public static class QueryResult {
+//        public String answer;
+//        public List<ScoredChunk> results;
+//        public QueryResult(String answer, List<ScoredChunk> results) {
+//            this.answer = answer; this.results = results;
+//        }
+//    }
 }

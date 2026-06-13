@@ -14,6 +14,7 @@ import com.google.gson.JsonObject;
 import com.zxl.agi.config.AppConfig;
 import com.zxl.agi.model.Chunk;
 import com.zxl.agi.model.ESHit;
+import com.zxl.agi.model.LongTermMemoryItem;
 import com.zxl.agi.model.MilvusHit;
 import io.milvus.v2.client.ConnectConfig;
 import io.milvus.v2.client.MilvusClientV2;
@@ -235,62 +236,54 @@ public class InfrastructureService {
     }
 
     /**
-     * PG 长期记忆
-     */
-    public static class LongTermRow {
-        public int id;
-        public String content;
-        public double importance;
-        public List<Float> embedding;
-        public Timestamp createdAt;
-        public Timestamp lastAccessed;
-    }
-
-    /**
      * 持久化长久记忆到 PostgreSQL
      * @param content
      * @param importance
      * @param embeddingJson
      * @return
      */
-    public int saveLongTermItem(String content, double importance, String embeddingJson) {
-        if (pgConn == null) return -1;
+    public Long saveLongTermItem(String content, double importance, String embeddingJson) {
+        if (pgConn == null) return -1L;
         try (PreparedStatement ps = pgConn.prepareStatement(
                 "INSERT INTO long_term_memory (content, importance, embedding) VALUES (?, ?, ?::jsonb) RETURNING id")) {
             ps.setString(1, content); ps.setDouble(2, importance); ps.setString(3, embeddingJson);
             try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getInt(1);
+                if (rs.next()) return rs.getLong(1);
             }
         } catch (SQLException e) {
             log.warn("⚠️ 长期记忆保存失败: {}", e.getMessage());
         }
-        return -1;
+        return -1L;
     }
 
     /**
      * 加载全部长期记忆条目
      * @return
      */
-    public List<LongTermRow> loadLongTermItems() {
-        List<LongTermRow> items = new ArrayList<>();
-        if (pgConn == null) return items;
+    public List<LongTermMemoryItem> loadLongTermItems() {
+        List<LongTermMemoryItem> items = new ArrayList<>();
+        if (pgConn == null) {
+            return items;
+        }
         try (Statement stmt = pgConn.createStatement();
              ResultSet rs = stmt.executeQuery(
                      "SELECT id, content, importance, embedding, COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW()) FROM long_term_memory ORDER BY id")) {
             while (rs.next()) {
-                LongTermRow row = new LongTermRow();
-                row.id = rs.getInt(1);
-                row.content = rs.getString(2);
-                row.importance = rs.getDouble(3);
+                LongTermMemoryItem row = LongTermMemoryItem.builder()
+                        .id(rs.getLong(1))
+                        .content(rs.getString(2))
+                        .importance(rs.getDouble(3))
+                        .createdAt(rs.getTimestamp(5).toLocalDateTime())
+                        .lastAccessed(rs.getTimestamp(6).toLocalDateTime())
+                        .build();
                 String embJson = rs.getString(4);
                 if (embJson != null && !embJson.isEmpty()) {
                     try {
-                        row.embedding = mapper.readValue(embJson, mapper.getTypeFactory().constructCollectionType(List.class, Float.class));
+                        row.setEmbedding(mapper.readValue(embJson, mapper.getTypeFactory().constructCollectionType(List.class, Float.class)));
                     } catch (Exception ignored) {
 
                     }
                 }
-                row.createdAt = rs.getTimestamp(5); row.lastAccessed = rs.getTimestamp(6);
                 items.add(row);
             }
         } catch (SQLException e) {
@@ -307,11 +300,14 @@ public class InfrastructureService {
      * @param importance
      * @param embeddingJson
      */
-    public void updateLongTermItem(int id, String content, double importance, String embeddingJson) {
+    public void updateLongTermItem(Long id, String content, double importance, String embeddingJson) {
         if (pgConn == null) return;
         try (PreparedStatement ps = pgConn.prepareStatement(
                 "UPDATE long_term_memory SET content = ?, importance = ?, embedding = ?::jsonb, last_accessed = NOW() WHERE id = ?")) {
-            ps.setString(1, content); ps.setDouble(2, importance); ps.setString(3, embeddingJson); ps.setInt(4, id);
+            ps.setString(1, content);
+            ps.setDouble(2, importance);
+            ps.setString(3, embeddingJson);
+            ps.setLong(4, id);
             ps.executeUpdate();
         } catch (SQLException e) {
             log.warn("长期记忆更新失败 (id={}): {}", id, e.getMessage());
@@ -322,11 +318,15 @@ public class InfrastructureService {
      * 批量删除长期记忆条目
      * @param ids
      */
-    public void deleteLongTermItems(List<Integer> ids) {
-        if (pgConn == null || ids.isEmpty()) return;
+    public void deleteLongTermItems(List<Long> ids) {
+        if (pgConn == null || ids.isEmpty()) {
+            return;
+        }
         String placeholders = String.join(",", ids.stream().map(i -> "?").toArray(String[]::new));
         try (PreparedStatement ps = pgConn.prepareStatement("DELETE FROM long_term_memory WHERE id IN (" + placeholders + ")")) {
-            for (int i = 0; i < ids.size(); i++) ps.setInt(i + 1, ids.get(i));
+            for (int i = 0; i < ids.size(); i++) {
+                ps.setLong(i + 1, ids.get(i));
+            }
             ps.executeUpdate();
         } catch (SQLException e) {
             log.warn("长期记忆批量删除失败: {}", e.getMessage());
@@ -347,7 +347,10 @@ public class InfrastructureService {
         try (PreparedStatement ps = pgConn.prepareStatement(
                 "INSERT INTO rag_chunks (doc_hash, chunk_idx, content, embedding) VALUES (?, ?, ?, ?::jsonb) " +
                 "ON CONFLICT (doc_hash, chunk_idx) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding RETURNING id")) {
-            ps.setString(1, docHash); ps.setInt(2, chunkIdx); ps.setString(3, content); ps.setString(4, embeddingJson);
+            ps.setString(1, docHash);
+            ps.setInt(2, chunkIdx);
+            ps.setString(3, content);
+            ps.setString(4, embeddingJson);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) return rs.getLong(1);
             }
@@ -385,7 +388,9 @@ public class InfrastructureService {
      */
     public List<Chunk> loadRAGChunksByIDs(List<Long> ids) {
         List<Chunk> chunks = new ArrayList<>();
-        if (pgConn == null || ids.isEmpty()) return chunks;
+        if (pgConn == null || ids.isEmpty()) {
+            return chunks;
+        }
         String placeholders = String.join(",", ids.stream().map(i -> "?").toArray(String[]::new));
         try (PreparedStatement ps = pgConn.prepareStatement("SELECT id, content FROM rag_chunks WHERE id IN (" + placeholders + ")")) {
             for (int i = 0; i < ids.size(); i++) ps.setLong(i + 1, ids.get(i));
@@ -815,11 +820,11 @@ public class InfrastructureService {
         }
     }
 
-    // ===== RAG Infra Init (stub) =====
-    public void initRAGInfra(int dim) {
-        // Milvus collection and ES index creation stubs
-        log.info("RAG 基础设施初始化完成 (Milvus/ES 未连接，使用 TF 降级)");
-    }
+//    // ===== RAG Infra Init (stub) =====
+//    public void initRAGInfra(int dim) {
+//        // Milvus collection and ES index creation stubs
+//        log.info("RAG 基础设施初始化完成 (Milvus/ES 未连接，使用 TF 降级)");
+//    }
 
     @PreDestroy
     public void close() {

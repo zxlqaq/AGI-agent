@@ -1,14 +1,19 @@
 package com.zxl.agi.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.zxl.agi.config.AppConfig;
 import com.zxl.agi.dto.ChatRequest;
 import com.zxl.agi.dto.ChatResponse;
+import com.zxl.agi.dto.RegisterMCPToolReq;
 import com.zxl.agi.infrastructure.InfrastructureService;
-import com.zxl.agi.model.*;
+import com.zxl.agi.model.Chunk;
+import com.zxl.agi.model.Snapshot;
+import com.zxl.agi.model.Tool;
 import com.zxl.agi.service.agent.UnifiedAgentService;
 import com.zxl.agi.service.rag.RagService;
-import com.zxl.agi.service.tools.ToolService;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.zxl.agi.service.tools.MCPToolFactory;
+import com.zxl.agi.service.tools.ToolRegistry;
+import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -26,23 +31,16 @@ import java.util.concurrent.Executors;
 @RestController
 @RequestMapping("/api")
 @CrossOrigin(origins = "*")
+@RequiredArgsConstructor
 public class AgentController {
 
-    private static final ObjectMapper mapper = new ObjectMapper();
     private final ExecutorService executor = Executors.newCachedThreadPool();
 
     private final UnifiedAgentService agent;
     private final InfrastructureService infra;
     private final AppConfig cfg;
-    private final ToolService toolService;
-
-    public AgentController(UnifiedAgentService agent, InfrastructureService infra,
-                           AppConfig cfg, ToolService toolService) {
-        this.agent = agent;
-        this.infra = infra;
-        this.cfg = cfg;
-        this.toolService = toolService;
-    }
+    private final MCPToolFactory mcpToolFactory;
+    private final ToolRegistry toolRegistry;
 
     /**
      * POST /api/chat - 统一对话入口
@@ -134,7 +132,9 @@ public class AgentController {
             Map<String, Object> info = new LinkedHashMap<>();
             info.put("name", t.getName());
             info.put("description", t.getDescription());
-            if (t.isMcp()) info.put("is_mcp", true);
+            if (t.getIsMcp()) {
+                info.put("is_mcp", true);
+            }
             if (t.getParameters() != null && !t.getParameters().isEmpty()) {
                 info.put("params", t.getParameters());
             }
@@ -147,32 +147,20 @@ public class AgentController {
      * POST /api/tools/mcp - 动态注册一个 MCP 工具
      */
     @PostMapping("/tools/mcp")
-    public Map<String, Object> registerMCPTool(@RequestBody Map<String, Object> req) {
-        String name = (String) req.get("name");
-        String description = (String) req.get("description");
-        String endpoint = (String) req.get("endpoint");
-
-        if (name == null || name.isEmpty() || endpoint == null || endpoint.isEmpty()) {
-            return Map.of("error", "name and endpoint are required");
+    public Map<String, Object> registerMCPTool(@RequestBody RegisterMCPToolReq req) {
+        if (req.getName() == null || req.getName().isBlank()) {
+            throw new IllegalArgumentException("name is required");
         }
 
-        List<ToolParam> params = new ArrayList<>();
-        @SuppressWarnings("unchecked")
-        List<Map<String, Object>> paramsList = (List<Map<String, Object>>) req.get("params");
-        if (paramsList != null) {
-            for (Map<String, Object> p : paramsList) {
-                params.add(new ToolParam(
-                        (String) p.get("name"),
-                        (String) p.get("type"),
-                        (String) p.get("description"),
-                        Boolean.TRUE.equals(p.get("required"))
-                ));
-            }
+        if (req.getEndpoint() == null || req.getEndpoint().isBlank()) {
+            throw new IllegalArgumentException("endpoint is required");
         }
 
-        Tool tool = toolService.createMCPTool(name, description != null ? description : "", endpoint, params);
+        Tool tool = mcpToolFactory.newMcpTool(req.getName(), req.getDescription(), req.getEndpoint(), req.getParams());
+        // 注册mcp工具
+        toolRegistry.registerTool(tool);
         agent.registerTool(tool);
-        return Map.of("ok", true, "name", name);
+        return Map.of("ok", true, "name", req.getName());
     }
 
     /**

@@ -6,6 +6,16 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import okhttp3.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -18,9 +28,15 @@ public class LlmService {
     private static final ObjectMapper mapper = new ObjectMapper();
     private final AppConfig cfg;
     private final OkHttpClient httpClient;
+    private final ChatModel chatModel;
+    private final EmbeddingModel embeddingModel;
 
-    public LlmService(AppConfig cfg) {
+    public LlmService(AppConfig cfg,
+                      ObjectProvider<ChatModel> chatModelProvider,
+                      ObjectProvider<EmbeddingModel> embeddingModelProvider) {
         this.cfg = cfg;
+        this.chatModel = chatModelProvider.getIfAvailable();
+        this.embeddingModel = embeddingModelProvider.getIfAvailable();
         this.httpClient = new OkHttpClient.Builder()
                 .connectTimeout(60, TimeUnit.SECONDS)
                 .readTimeout(60, TimeUnit.SECONDS)
@@ -38,6 +54,13 @@ public class LlmService {
      */
     public String chat(String systemPrompt, List<Map<String, String>> messages) {
         if (cfg.isRealLLM()) {
+            if (chatModel != null) {
+                try {
+                    return callSpringAi(systemPrompt, messages);
+                } catch (Exception e) {
+                    log.warn("Spring AI LLM API call failed: {}, falling back to raw HTTP", e.getMessage());
+                }
+            }
             try {
                 return callAPI(systemPrompt, messages);
             } catch (Exception e) {
@@ -46,6 +69,34 @@ public class LlmService {
             }
         }
         return mock(messages);
+    }
+
+    private String callSpringAi(String systemPrompt, List<Map<String, String>> messages) {
+        List<Message> promptMessages = new ArrayList<>();
+        if (systemPrompt != null && !systemPrompt.isEmpty()) {
+            promptMessages.add(new SystemMessage(systemPrompt));
+        }
+        for (Map<String, String> message : messages) {
+            String role = message.getOrDefault("role", "user");
+            String content = message.getOrDefault("content", "");
+            if ("assistant".equals(role)) {
+                promptMessages.add(new AssistantMessage(content));
+            } else if ("system".equals(role)) {
+                promptMessages.add(new SystemMessage(content));
+            } else {
+                promptMessages.add(new UserMessage(content));
+            }
+        }
+
+        ChatOptions options = ChatOptions.builder()
+                .model(cfg.getLlm().getModel())
+                .temperature(cfg.getLlm().getTemperature())
+                .build();
+        ChatResponse response = chatModel.call(new Prompt(promptMessages, options));
+        if (response == null || response.getResult() == null || response.getResult().getOutput() == null) {
+            throw new RuntimeException("Spring AI returned an empty chat response");
+        }
+        return response.getResult().getOutput().getText();
     }
 
     private String callAPI(String systemPrompt, List<Map<String, String>> messages) throws Exception {
@@ -92,9 +143,12 @@ public class LlmService {
      * @param text
      * @return
      */
-    public List<Double> embed(String text) {
+    public List<Float> embed(String text) {
         if (!cfg.isRealEmbedding()) return null;
         try {
+            if (embeddingModel != null && !isMultimodalEmbedding()) {
+                return callSpringAiEmbedding(text);
+            }
             return callEmbedAPI(text);
         } catch (Exception e) {
             log.warn("Embedding API 调用失败: {}", e.getMessage());
@@ -102,9 +156,26 @@ public class LlmService {
         }
     }
 
-    private List<Double> callEmbedAPI(String text) throws Exception {
+    private List<Float> callSpringAiEmbedding(String text) {
+        float[] vector = embeddingModel.embed(text);
+        if (vector.length == 0) {
+            throw new RuntimeException("Spring AI returned an empty embedding response");
+        }
+        List<Float> embedding = new ArrayList<>(vector.length);
+        for (float value : vector) {
+            embedding.add(value);
+        }
+        return embedding;
+    }
+
+    private boolean isMultimodalEmbedding() {
         String apiUrl = cfg.getEmbedding().getApiUrl();
-        boolean isMultimodal = apiUrl != null && apiUrl.contains("/embeddings/multimodal");
+        return apiUrl != null && apiUrl.contains("/embeddings/multimodal");
+    }
+
+    private List<Float> callEmbedAPI(String text) throws Exception {
+        String apiUrl = cfg.getEmbedding().getApiUrl();
+        boolean isMultimodal = isMultimodalEmbedding();
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", cfg.getEmbedding().getModel());
@@ -141,8 +212,10 @@ public class LlmService {
             if (embNode == null || !embNode.isArray() || embNode.isEmpty()) {
                 throw new RuntimeException("Embedding 返回空向量");
             }
-            List<Double> embedding = new ArrayList<>();
-            for (JsonNode n : embNode) embedding.add(n.asDouble());
+            List<Float> embedding = new ArrayList<>();
+            for (JsonNode n : embNode) {
+                embedding.add(n.floatValue());
+            }
             return embedding;
         }
     }
