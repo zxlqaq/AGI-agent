@@ -102,10 +102,7 @@ public class HybridStore {
         // 批量写Milvus
         if (!pgIds.isEmpty()) {
             try {
-                infra.insertRagChunks(
-                        pgIds,
-                        contents,
-                        embeddings
+                infra.insertVectors("rag_chunks", pgIds, embeddings
                 );
             } catch (Exception e) {
                 log.warn("RAG chunks写入Milvus失败 exception: {}", e.getMessage());
@@ -154,7 +151,7 @@ public class HybridStore {
         // 删除Milvus向量
         if ("connected".equals(infra.getEsStatus())) {
             try {
-                infra.deleteRagChunksFromMilvus(pgIds);
+                infra.deleteVectors("rag_chunks", pgIds);
             } catch (Exception e) {
                 log.warn("Milvus 删除 RAG chunks 失败: {}", e.getMessage());
             }
@@ -199,7 +196,7 @@ public class HybridStore {
         List<ESHit> esHits;
 
         try {
-            milvusHits = infra.milvusSearchWithScores("rag_chunks", queryEmb, fetchK);
+            milvusHits = infra.searchVectors("rag_chunks", queryEmb, fetchK);
         } catch (Exception e) {
             log.warn("⚠️ Milvus检索失败，降级ES使用关键词检索: {}", e.getMessage());
             return searchKeyword(query, topK);
@@ -326,7 +323,7 @@ public class HybridStore {
 
         List<MilvusHit> hits;
         try {
-            hits = infra.milvusSearchWithScores("rag_chunks", emb, topK);
+            hits = infra.searchVectors("rag_chunks", emb, topK);
         } catch (Exception e) {
             log.warn("⚠️ Milvus失败: {}", e.getMessage());
             return Collections.emptyList();

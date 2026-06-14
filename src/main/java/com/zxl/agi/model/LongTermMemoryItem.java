@@ -44,6 +44,13 @@ public class LongTermMemoryItem {
     private List<Float> embedding;
 
     /**
+     * Milvus召回相似度
+     *
+     * 不持久化
+     */
+    private Float similarity;
+
+    /**
      * 召回阶段计算出的综合得分
      *
      * 不持久化

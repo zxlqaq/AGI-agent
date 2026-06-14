@@ -239,14 +239,14 @@ public class InfrastructureService {
      * 持久化长久记忆到 PostgreSQL
      * @param content
      * @param importance
-     * @param embeddingJson
      * @return
      */
-    public Long saveLongTermItem(String content, double importance, String embeddingJson) {
+    public Long saveLongTermItem(String content, double importance) {
         if (pgConn == null) return -1L;
         try (PreparedStatement ps = pgConn.prepareStatement(
-                "INSERT INTO long_term_memory (content, importance, embedding) VALUES (?, ?, ?::jsonb) RETURNING id")) {
-            ps.setString(1, content); ps.setDouble(2, importance); ps.setString(3, embeddingJson);
+                "INSERT INTO long_term_memory (content, importance) VALUES (?, ?) RETURNING id")) {
+            ps.setString(1, content);
+            ps.setDouble(2, importance);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) return rs.getLong(1);
             }
@@ -260,30 +260,30 @@ public class InfrastructureService {
      * 加载全部长期记忆条目
      * @return
      */
-    public List<LongTermMemoryItem> loadLongTermItems() {
+    public List<LongTermMemoryItem> loadAllLongTermItems() {
         List<LongTermMemoryItem> items = new ArrayList<>();
         if (pgConn == null) {
             return items;
         }
         try (Statement stmt = pgConn.createStatement();
              ResultSet rs = stmt.executeQuery(
-                     "SELECT id, content, importance, embedding, COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW()) FROM long_term_memory ORDER BY id")) {
+                     "SELECT id, content, importance, COALESCE(created_at, NOW()), COALESCE(last_accessed, NOW()) FROM long_term_memory ORDER BY id")) {
             while (rs.next()) {
                 LongTermMemoryItem row = LongTermMemoryItem.builder()
-                        .id(rs.getLong(1))
-                        .content(rs.getString(2))
-                        .importance(rs.getDouble(3))
-                        .createdAt(rs.getTimestamp(5).toLocalDateTime())
-                        .lastAccessed(rs.getTimestamp(6).toLocalDateTime())
+                        .id(rs.getLong("id"))
+                        .content(rs.getString("content"))
+                        .importance(rs.getDouble("importance"))
+                        .createdAt(rs.getTimestamp("created_at").toLocalDateTime())
+                        .lastAccessed(rs.getTimestamp("last_accessed").toLocalDateTime())
                         .build();
-                String embJson = rs.getString(4);
-                if (embJson != null && !embJson.isEmpty()) {
-                    try {
-                        row.setEmbedding(mapper.readValue(embJson, mapper.getTypeFactory().constructCollectionType(List.class, Float.class)));
-                    } catch (Exception ignored) {
-
-                    }
-                }
+//                String embJson = rs.getString(4);
+//                if (embJson != null && !embJson.isEmpty()) {
+//                    try {
+//                        row.setEmbedding(mapper.readValue(embJson, mapper.getTypeFactory().constructCollectionType(List.class, Float.class)));
+//                    } catch (Exception ignored) {
+//
+//                    }
+//                }
                 items.add(row);
             }
         } catch (SQLException e) {
@@ -292,22 +292,58 @@ public class InfrastructureService {
         return items;
     }
 
+    public List<LongTermMemoryItem> loadLongTermItemsByIds(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        String placeholders = ids.stream()
+                .map(id -> "?")
+                .collect(Collectors.joining(","));
+
+        String sql = "SELECT id,content,importance,created_at,last_accessed " +
+                        "FROM long_term_memory " +
+                        "WHERE id IN (" + placeholders + ")";
+
+        List<LongTermMemoryItem> result = new ArrayList<>();
+
+        try (PreparedStatement ps = pgConn.prepareStatement(sql)) {
+            for (int i = 0; i < ids.size(); i++) {
+                ps.setLong(i + 1, ids.get(i));
+            }
+
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    LongTermMemoryItem item = new LongTermMemoryItem();
+                    item.setId(rs.getLong("id"));
+                    item.setContent(rs.getString("content"));
+                    item.setImportance(rs.getDouble("importance"));
+                    item.setCreatedAt(rs.getTimestamp("created_at").toLocalDateTime());
+                    item.setLastAccessed(rs.getTimestamp("last_accessed").toLocalDateTime());
+                    result.add(item);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("loadLongTermItemsByIds failed", e);
+        }
+
+        return result;
+    }
+
     /**
      * 长期记忆合并
      * 更新长期记忆条目的内容和重要性
      * @param id
      * @param content
      * @param importance
-     * @param embeddingJson
      */
-    public void updateLongTermItem(Long id, String content, double importance, String embeddingJson) {
+    public void updateLongTermItem(Long id, String content, double importance) {
         if (pgConn == null) return;
         try (PreparedStatement ps = pgConn.prepareStatement(
-                "UPDATE long_term_memory SET content = ?, importance = ?, embedding = ?::jsonb, last_accessed = NOW() WHERE id = ?")) {
+                "UPDATE long_term_memory SET content = ?, importance = ?, last_accessed = NOW() WHERE id = ?")) {
             ps.setString(1, content);
             ps.setDouble(2, importance);
-            ps.setString(3, embeddingJson);
-            ps.setLong(4, id);
+            ps.setLong(3, id);
             ps.executeUpdate();
         } catch (SQLException e) {
             log.warn("长期记忆更新失败 (id={}): {}", id, e.getMessage());
@@ -319,17 +355,17 @@ public class InfrastructureService {
      * @param ids
      */
     public void deleteLongTermItems(List<Long> ids) {
-        if (pgConn == null || ids.isEmpty()) {
+        if (ids == null || ids.isEmpty()) {
             return;
         }
-        String placeholders = String.join(",", ids.stream().map(i -> "?").toArray(String[]::new));
-        try (PreparedStatement ps = pgConn.prepareStatement("DELETE FROM long_term_memory WHERE id IN (" + placeholders + ")")) {
-            for (int i = 0; i < ids.size(); i++) {
-                ps.setLong(i + 1, ids.get(i));
-            }
+
+        String sql = "DELETE FROM long_term_memory WHERE id = ANY (?)";
+        try (PreparedStatement ps = pgConn.prepareStatement(sql)) {
+            Array arr = pgConn.createArrayOf("bigint", ids.toArray());
+            ps.setArray(1, arr);
             ps.executeUpdate();
         } catch (SQLException e) {
-            log.warn("长期记忆批量删除失败: {}", e.getMessage());
+            log.warn("删除长期记忆失败: {}", e.getMessage());
         }
     }
 
@@ -579,7 +615,7 @@ public class InfrastructureService {
     /**
      * EnsureRAGCollection 创建 rag_chunks Milvus collection（如不存在或维度不匹配则重建）
      */
-    public void ensureRagCollection(Integer dim) {
+    public void ensureRagCollection(String collectionName, Integer dim) {
         if (milvusClient == null) {
             throw new RuntimeException("milvus not connected");
         }
@@ -587,7 +623,7 @@ public class InfrastructureService {
         try {
             // 检查Collection是否存在
             boolean exists = milvusClient.hasCollection(HasCollectionReq.builder()
-                            .collectionName("rag_chunks")
+                            .collectionName(collectionName)
                             .build());
             if (exists) {
                 return;
@@ -595,7 +631,7 @@ public class InfrastructureService {
 
             // 创建Collection
             milvusClient.createCollection(CreateCollectionReq.builder()
-                            .collectionName("rag_chunks")
+                            .collectionName(collectionName)
                             .dimension(dim)
                             .build());
             log.info("Milvus rag_chunks collection 已创建");
@@ -607,9 +643,9 @@ public class InfrastructureService {
     /**
      * InsertRAGChunks 批量将 RAG chunk 向量插入 Milvus
      */
-    public void insertRagChunks(List<Long> pgIds,
-                                List<String> contents,
-                                List<List<Float>> embeddings) {
+    public void insertVectors(String collectionName, List<Long> pgIds,
+//                                List<String> contents,
+                              List<List<Float>> embeddings) {
         if (milvusClient == null) {
             throw new RuntimeException("milvus not connected");
         }
@@ -619,7 +655,7 @@ public class InfrastructureService {
             for (int i = 0; i < pgIds.size(); i++) {
                 JsonObject row = new JsonObject();
                 row.addProperty("pg_id", pgIds.get(i));
-                row.addProperty("content", contents.get(i));
+//                row.addProperty("content", contents.get(i));
                 JsonArray vector = new JsonArray();
                 for (Float v : embeddings.get(i)) {
                     vector.add(v);
@@ -629,7 +665,7 @@ public class InfrastructureService {
             }
 
             milvusClient.insert(InsertReq.builder()
-                            .collectionName("rag_chunks")
+                            .collectionName(collectionName)
                             .data(rows)
                             .build());
         } catch (Exception e) {
@@ -640,7 +676,7 @@ public class InfrastructureService {
     /**
      * MilvusSearch 在 Milvus 中进行向量近邻搜索，返回匹配文档ID列表
      */
-    public List<Long> milvusSearch(String collection,
+    public List<Long> milvusSearch(String collectionName,
                                    List<Float> vector,
                                    Integer topK) {
         if (milvusClient == null) {
@@ -649,7 +685,7 @@ public class InfrastructureService {
 
         try {
             SearchResp resp = milvusClient.search(SearchReq.builder()
-                    .collectionName(collection)
+                    .collectionName(collectionName)
                     .annsField("embedding")
                     .topK(topK)
                     .outputFields(List.of("pg_id"))
@@ -674,11 +710,11 @@ public class InfrastructureService {
     }
 
     /**
-     * MilvusSearchWithScores 在 Milvus 中进行向量近邻搜索，返回ID和距离
+     * searchVectors 在 Milvus 中进行向量近邻搜索，返回ID和距离
      */
-    public List<MilvusHit> milvusSearchWithScores(String collection,
-                                                  List<Float> vector,
-                                                  Integer topK) {
+    public List<MilvusHit> searchVectors(String collectionName,
+                                         List<Float> vector,
+                                         Integer topK) {
         if (milvusClient == null) {
             throw new RuntimeException("milvus not connected");
         }
@@ -686,7 +722,7 @@ public class InfrastructureService {
         try {
             SearchResp resp = milvusClient.search(
                     SearchReq.builder()
-                            .collectionName(collection)
+                            .collectionName(collectionName)
                             .annsField("embedding")
                             .topK(topK)
                             .outputFields(List.of("pg_id"))
@@ -702,10 +738,7 @@ public class InfrastructureService {
                     if (!(id instanceof Number number)) {
                         continue;
                     }
-                    hits.add(new MilvusHit(
-                            number.longValue(),
-                            result.getScore()
-                            )
+                    hits.add(new MilvusHit(number.longValue(), result.getScore())
                     );
                 }
             }
@@ -716,9 +749,9 @@ public class InfrastructureService {
     }
 
     /**
-     * DeleteRAGChunksFromMilvus 删除Milvus中的向量
+     * deleteVectors 删除Milvus中的向量
      */
-    public void deleteRagChunksFromMilvus(List<Long> pgIds) {
+    public void deleteVectors(String collectionName, List<Long> pgIds) {
         if (milvusClient == null) {
             throw new RuntimeException("milvus not connected");
         }
@@ -732,12 +765,47 @@ public class InfrastructureService {
 
             milvusClient.delete(
                     DeleteReq.builder()
-                            .collectionName("rag_chunks")
+                            .collectionName(collectionName)
                             .filter(expr)
                             .build()
             );
         } catch (Exception e) {
             throw new RuntimeException("delete rag chunks from milvus failed", e);
+        }
+    }
+
+    public MilvusHit searchNearestMemory(List<Float> embedding) {
+        List<MilvusHit> hits = searchVectors(
+                "long_term_memory_vectors",
+                embedding,
+                1
+        );
+
+        if (hits.isEmpty()) {
+            return null;
+        }
+
+        return hits.get(0);
+    }
+
+    /**
+     * 更新长期记忆访问时间和重要度
+     */
+    public void updateLongTermMemoryAccess(Long id, Double importance) {
+        String sql = """
+        UPDATE long_term_memory
+        SET
+            importance = GREATEST(importance, ?),
+            last_accessed = NOW()
+        WHERE id = ?
+        """;
+
+        try (PreparedStatement ps = pgConn.prepareStatement(sql)) {
+            ps.setDouble(1, importance);
+            ps.setLong(2, id);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.warn("updateLongTermMemoryAccess failed", e);
         }
     }
 
@@ -748,7 +816,9 @@ public class InfrastructureService {
         // 初始化Milvus Collection
         if ("connected".equals(milvusStatus)) {
             try {
-                ensureRagCollection(dim);
+                // 初始化向量Milvus collection
+                ensureRagCollection("rag_chunks", dim);
+                ensureRagCollection("long_term_memory_vectors", dim);
             } catch (Exception e) {
                 log.warn("Milvus rag_chunks 初始化失败: {}", e.getMessage());
             }

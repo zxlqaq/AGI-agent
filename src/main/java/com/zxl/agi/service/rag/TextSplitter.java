@@ -21,7 +21,9 @@ public class TextSplitter {
     public List<Chunk> split(String text) {
         List<Chunk> chunks = new ArrayList<>();
         int step = chunkSize - overlap;
-        if (step <= 0) step = chunkSize;
+        if (step <= 0) {
+            step = chunkSize;
+        }
 
         int[] codePoints = text.codePoints().toArray();
         int id = 0;

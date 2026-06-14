@@ -194,10 +194,9 @@ public class UnifiedAgentService {
                     infra.savePreference("default", key, value);
                     String content = String.format("用户%s: %s", key, value);
                     List<Float> embedding = llm.embed(content);
-                    boolean stored = ltm.store(content, 0.8D, embedding);
-                    if (stored) {
-                        String embJson = mapper.writeValueAsString(embedding);
-                        Long pgId = infra.saveLongTermItem(content, 0.8D, embJson);
+                    Long store = ltm.store(content, 0.8D, embedding);
+                    if (store > 0) {
+                        Long pgId = infra.saveLongTermItem(content, 0.8D);
                         ltm.syncLastItemPGID(pgId);
                     }
                 }
@@ -894,7 +893,7 @@ public class UnifiedAgentService {
             }
 
             // 长期记忆召回
-            List<LongTermMemoryItem> items = ltm.recall(query, cfg.getMemory().getLongTermTopK(), queryEmbedding);
+            List<LongTermMemoryItem> items = ltm.recall(queryEmbedding, cfg.getMemory().getLongTermTopK());
 
             if (!CollectionUtils.isEmpty(items)) {
                 StringBuilder memoryBuilder = new StringBuilder("【相关记忆】\n");
@@ -989,10 +988,8 @@ public class UnifiedAgentService {
                 infra.savePreference("default", e.getKey(), e.getValue());
                 String content = "用户" + e.getKey() + ": " + e.getValue();
                 List<Float> emb = llm.embed(content);
-                if (ltm.store(content, 0.7, emb)) {
-                    String embJson = "null";
-                    try { if (emb != null) embJson = mapper.writeValueAsString(emb); } catch (Exception ignored) {}
-                    Long pgId = infra.saveLongTermItem(content, 0.7, embJson);
+                if (ltm.store(content, 0.7, emb) > 0) {
+                    Long pgId = infra.saveLongTermItem(content, 0.7);
                     ltm.syncLastItemPGID(pgId);
                 }
                 log.info("🧠 从回复中提取记忆：{} = {}", e.getKey(), e.getValue());
@@ -1019,7 +1016,7 @@ public class UnifiedAgentService {
             } catch (Exception ignored) {
 
             }
-            infra.updateLongTermItem(item.getId(), item.getContent(), item.getImportance(), embJson);
+            infra.updateLongTermItem(item.getId(), item.getContent(), item.getImportance());
             log.info("🔗 记忆合并：更新 id={}", item.getId());
         }
     }
@@ -1035,7 +1032,7 @@ public class UnifiedAgentService {
         pref.saveBatch(prefs);
 
         // 恢复长期记忆
-        List<LongTermMemoryItem> rows = infra.loadLongTermItems();
+        List<LongTermMemoryItem> rows = infra.loadAllLongTermItems();
         for (LongTermMemoryItem row : rows) {
             LongTermMemoryItem item = new LongTermMemoryItem();
             item.setId(row.getId());
