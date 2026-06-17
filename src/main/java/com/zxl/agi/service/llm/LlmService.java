@@ -54,13 +54,13 @@ public class LlmService {
      */
     public String chat(String systemPrompt, List<Map<String, String>> messages) {
         if (cfg.isRealLLM()) {
-            if (chatModel != null) {
-                try {
-                    return callSpringAi(systemPrompt, messages);
-                } catch (Exception e) {
-                    log.warn("Spring AI LLM API call failed: {}, falling back to raw HTTP", e.getMessage());
-                }
-            }
+//            if (chatModel != null) {
+//                try {
+//                    return callSpringAi(systemPrompt, messages);
+//                } catch (Exception e) {
+//                    log.warn("Spring AI LLM API call failed: {}, falling back to raw HTTP", e.getMessage());
+//                }
+//            }
             try {
                 return callAPI(systemPrompt, messages);
             } catch (Exception e) {
@@ -144,11 +144,13 @@ public class LlmService {
      * @return
      */
     public List<Float> embed(String text) {
-        if (!cfg.isRealEmbedding()) return null;
+        if (!cfg.isRealEmbedding()) {
+            return null;
+        }
         try {
-            if (embeddingModel != null && !isMultimodalEmbedding()) {
-                return callSpringAiEmbedding(text);
-            }
+//            if (embeddingModel != null && !isMultimodalEmbedding()) {
+//                return callSpringAiEmbedding(text);
+//            }
             return callEmbedAPI(text);
         } catch (Exception e) {
             log.warn("Embedding API 调用失败: {}", e.getMessage());
@@ -228,11 +230,16 @@ public class LlmService {
      * @return
      */
     public Map<String, String> extractPreferences(String msg) {
-        if (!cfg.isRealLLM()) return extractRuleBased(msg);
+        if (!cfg.isRealLLM()) {
+            return extractRuleBased(msg);
+        }
         try {
             String prompt = "从下面这句用户消息中，提取所有用户的个人信息和偏好，输出 JSON 对象（key为中文名称，value为具体值）。\n如果没有任何偏好信息，输出 {}。\n只输出 JSON，不要有其他内容。\n\n消息：" + msg;
             String raw = callAPI("", List.of(Map.of("role", "user", "content", prompt)));
-            raw = raw.trim().replace("```json", "").replace("```", "").trim();
+            raw = raw.trim()
+                    .replace("```json", "")
+                    .replace("```", "")
+                    .trim();
             @SuppressWarnings("unchecked")
             Map<String, String> result = mapper.readValue(raw, Map.class);
             return result;

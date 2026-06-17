@@ -19,6 +19,7 @@ import com.zxl.agi.model.MilvusHit;
 import io.milvus.v2.client.ConnectConfig;
 import io.milvus.v2.client.MilvusClientV2;
 import io.milvus.v2.service.collection.request.CreateCollectionReq;
+import io.milvus.v2.service.collection.request.DropCollectionReq;
 import io.milvus.v2.service.collection.request.HasCollectionReq;
 import io.milvus.v2.service.vector.request.DeleteReq;
 import io.milvus.v2.service.vector.request.InsertReq;
@@ -626,14 +627,18 @@ public class InfrastructureService {
                             .collectionName(collectionName)
                             .build());
             if (exists) {
+//                milvusClient.dropCollection(DropCollectionReq.builder()
+//                        .collectionName(collectionName)
+//                        .build());
                 return;
             }
 
             // 创建Collection
             milvusClient.createCollection(CreateCollectionReq.builder()
-                            .collectionName(collectionName)
-                            .dimension(dim)
-                            .build());
+                    .collectionName(collectionName)
+                    .dimension(dim)
+                    .autoID(true)
+                    .build());
             log.info("Milvus rag_chunks collection 已创建");
         } catch (Exception e) {
             throw new RuntimeException("create rag_chunks collection failed", e);
@@ -660,7 +665,7 @@ public class InfrastructureService {
                 for (Float v : embeddings.get(i)) {
                     vector.add(v);
                 }
-                row.add("embedding", vector);
+                row.add("vector", vector);
                 rows.add(row);
             }
 
@@ -686,7 +691,7 @@ public class InfrastructureService {
         try {
             SearchResp resp = milvusClient.search(SearchReq.builder()
                     .collectionName(collectionName)
-                    .annsField("embedding")
+                    .annsField("vector")
                     .topK(topK)
                     .outputFields(List.of("pg_id"))
                     .data(List.of(new FloatVec(vector)))
@@ -696,7 +701,7 @@ public class InfrastructureService {
             for (List<SearchResp.SearchResult> results : resp.getSearchResults()) {
                 for (SearchResp.SearchResult result : results) {
                     // TODO 有的版本id会放进result.getEntity()，eg：Long pgId = ((Number) result.getEntity().get("pg_id")).longValue();
-                    Object id = result.getId();
+                    Object id = result.getEntity().get("pg_id");
                     if (id instanceof Number number) {
                         ids.add(number.longValue());
                     }
@@ -723,7 +728,7 @@ public class InfrastructureService {
             SearchResp resp = milvusClient.search(
                     SearchReq.builder()
                             .collectionName(collectionName)
-                            .annsField("embedding")
+                            .annsField("vector")
                             .topK(topK)
                             .outputFields(List.of("pg_id"))
                             .data(List.of(new FloatVec(vector)))
@@ -734,7 +739,7 @@ public class InfrastructureService {
             // 遍历查询结果
             for (List<SearchResp.SearchResult> results : resp.getSearchResults()) {
                 for (SearchResp.SearchResult result : results) {
-                    Object id = result.getId();
+                    Object id = result.getEntity().get("pg_id");
                     if (!(id instanceof Number number)) {
                         continue;
                     }

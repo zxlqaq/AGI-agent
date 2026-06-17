@@ -102,8 +102,7 @@ public class HybridStore {
         // 批量写Milvus
         if (!pgIds.isEmpty()) {
             try {
-                infra.insertVectors("rag_chunks", pgIds, embeddings
-                );
+                infra.insertVectors("rag_chunks", pgIds, embeddings);
             } catch (Exception e) {
                 log.warn("RAG chunks写入Milvus失败 exception: {}", e.getMessage());
             }

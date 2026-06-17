@@ -75,7 +75,7 @@ public class AppConfig {
         private int rrfConstantK = 60;
         private double semanticWeight = 0.7;
         private boolean enableHybridSearch = true;
-        private int ragMilvusDim = 2048;
+        private int ragMilvusDim = 1024;
     }
 
     @Data
