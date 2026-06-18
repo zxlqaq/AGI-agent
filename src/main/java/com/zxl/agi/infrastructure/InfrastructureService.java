@@ -18,9 +18,11 @@ import com.zxl.agi.model.LongTermMemoryItem;
 import com.zxl.agi.model.MilvusHit;
 import io.milvus.v2.client.ConnectConfig;
 import io.milvus.v2.client.MilvusClientV2;
+import io.milvus.v2.common.IndexParam;
 import io.milvus.v2.service.collection.request.CreateCollectionReq;
-import io.milvus.v2.service.collection.request.DropCollectionReq;
 import io.milvus.v2.service.collection.request.HasCollectionReq;
+import io.milvus.v2.service.collection.request.LoadCollectionReq;
+import io.milvus.v2.service.index.request.CreateIndexReq;
 import io.milvus.v2.service.vector.request.DeleteReq;
 import io.milvus.v2.service.vector.request.InsertReq;
 import io.milvus.v2.service.vector.request.SearchReq;
@@ -497,7 +499,7 @@ public class InfrastructureService {
     }
 
     /**
-     * 创建RAG索引
+     * 创建ES索引
      */
     public void ensureRagIndex() {
         try {
@@ -639,14 +641,66 @@ public class InfrastructureService {
                     .dimension(dim)
                     .autoID(true)
                     .build());
-            log.info("Milvus rag_chunks collection 已创建");
+            // 创建HNSW索引
+            createHnswIndex(collectionName);
+
+            log.info("Milvus collection创建成功: {}", collectionName);
         } catch (Exception e) {
-            throw new RuntimeException("create rag_chunks collection failed", e);
+            throw new RuntimeException("create collection failed", e);
         }
     }
 
     /**
-     * InsertRAGChunks 批量将 RAG chunk 向量插入 Milvus
+     * 创建HNSW索引
+     */
+    public void createHnswIndex(String collectionName) {
+
+        if (milvusClient == null) {
+            throw new RuntimeException("milvus not connected");
+        }
+
+        try {
+
+            // 构建HNSW索引参数
+            Map<String, Object> extraParams = Map.of(
+                    "M", 32, // 每个节点的最大连接数，越大召回越高但内存越大
+                    "efConstruction", 400 // 构建时的搜索宽度，越大构建越慢但质量越高
+            );
+            IndexParam indexParam = IndexParam.builder()
+                    .fieldName("vector")
+                    .indexName("vector_hnsw")
+                    .indexType(IndexParam.IndexType.HNSW)
+                    .metricType(IndexParam.MetricType.COSINE)
+                    .extraParams(extraParams)
+                    .build();
+
+            // 创建索引
+            milvusClient.createIndex(
+                    CreateIndexReq.builder()
+                            .collectionName(collectionName)
+                            .indexParams(Collections.singletonList(indexParam))
+                            .build()
+            );
+
+            // 加载 Collection（创建索引后需要 load 才能搜索）
+            milvusClient.loadCollection(
+                    LoadCollectionReq.builder()
+                            .collectionName(collectionName)
+                            .build()
+            );
+
+            log.info("Milvus HNSW索引创建成功: {}", collectionName);
+
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "create index failed: " + collectionName,
+                    e
+            );
+        }
+    }
+
+    /**
+     * InsertRAGChunks 批量将向量插入 Milvus
      */
     public void insertVectors(String collectionName, List<Long> pgIds,
 //                                List<String> contents,
@@ -674,7 +728,7 @@ public class InfrastructureService {
                             .data(rows)
                             .build());
         } catch (Exception e) {
-            throw new RuntimeException("insert rag chunks failed", e);
+            throw new RuntimeException("insert Milvus failed", e);
         }
     }
 
@@ -693,6 +747,7 @@ public class InfrastructureService {
                     .collectionName(collectionName)
                     .annsField("vector")
                     .topK(topK)
+                    .searchParams(Map.of("ef", 128)) // 搜索时的候选队列大小，越大 → 召回↑、延迟↑
                     .outputFields(List.of("pg_id"))
                     .data(List.of(new FloatVec(vector)))
                     .build());
@@ -730,6 +785,7 @@ public class InfrastructureService {
                             .collectionName(collectionName)
                             .annsField("vector")
                             .topK(topK)
+                            .searchParams(Map.of("ef", 128)) // // 搜索时的候选队列大小，越大 → 召回↑、延迟↑
                             .outputFields(List.of("pg_id"))
                             .data(List.of(new FloatVec(vector)))
                             .build()
