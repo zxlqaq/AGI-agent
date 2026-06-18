@@ -75,7 +75,19 @@ public class AppConfig {
         private int rrfConstantK = 60;
         private double semanticWeight = 0.7;
         private boolean enableHybridSearch = true;
+
+        /**
+         * 向量维度
+         */
         private int ragMilvusDim = 1024;
+
+        /**
+         * RAG最低命中阈值
+         *
+         * 小于该值认为知识库不可靠
+         * 自动Fallback到普通对话
+         */
+        private double ragHitThreshold = 0.60;
     }
 
     @Data

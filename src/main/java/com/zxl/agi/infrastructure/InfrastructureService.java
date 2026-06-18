@@ -849,7 +849,9 @@ public class InfrastructureService {
     public void saveChatHistory(String role, String content) {
         if (pgConn == null) return;
         try (PreparedStatement ps = pgConn.prepareStatement("INSERT INTO chat_history (role, content) VALUES (?, ?)")) {
-            ps.setString(1, role); ps.setString(2, content); ps.executeUpdate();
+            ps.setString(1, role);
+            ps.setString(2, content);
+            ps.executeUpdate();
         } catch (SQLException e) {
             log.warn("聊天记录保存失败: {}", e.getMessage());
         }

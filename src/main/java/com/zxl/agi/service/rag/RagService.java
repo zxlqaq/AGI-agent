@@ -91,19 +91,35 @@ public class RagService {
      */
     public RagQueryResult query(String question) {
         if (!loaded) {
-            return new RagQueryResult("知识库为空，请先上传文档。", Collections.emptyList());
+            return new RagQueryResult(
+                    false,
+                    0D,
+                    "知识库为空，请先上传文档。",
+                    Collections.emptyList()
+            );
         }
 
         // TF-based search (fallback when Milvus/ES unavailable)
 //        List<ScoredChunk> results = tfSearch(question, cfg.getRag().getTopK());
         List<HybridResult> hybridResults = store.search(question, cfg.getRag().getTopK());
         if (hybridResults.isEmpty()) {
-            return new RagQueryResult("知识库中未找到相关内容。", Collections.emptyList());
+            return new RagQueryResult(
+                    false,
+                    0D,
+                    "知识库中未找到相关内容。",
+                    Collections.emptyList()
+            );
         }
 
         List<SearchResult> results = hybridResults.stream()
                 .map(hr -> new SearchResult(hr.getChunk(), hr.getScore()))
                 .toList();
+
+        // 计算最高召回分数
+        double maxScore = hybridResults.stream()
+                .mapToDouble(HybridResult::getScore)
+                .max()
+                .orElse(0D);
 
         String context = results.stream()
                 .map(SearchResult::getChunk)
@@ -114,9 +130,15 @@ public class RagService {
 
         // 未命中知识库
         if (context.isBlank()) {
-            return new RagQueryResult("知识库中未命中！", results);
+            return new RagQueryResult(
+                    false,
+                    maxScore,
+                    "知识库中未命中！",
+                    results
+            );
         }
 
+        // 命中知识库
         if (generateFn != null) {
             String systemPrompt = "你是一个基于知识库回答问题的助手。" +
                     "请仅根据提供的上下文内容回答问题，不要编造信息。" +
@@ -124,13 +146,19 @@ public class RagService {
             String userMsg = String.format("上下文：\n%s\n\n问题：%s", context, question);
             String answer = generateFn.apply(systemPrompt, userMsg);
             return new RagQueryResult(
+                    true,
+                    maxScore,
                     answer,
                     results
             );
         }
 
         // 无LLM时直接返回原文
-        return new RagQueryResult("【知识库检索结果】\n" + context, results);
+        return new RagQueryResult(
+                true,
+                maxScore,
+                "【知识库检索结果】\n" + context,
+                results);
     }
 
     /**

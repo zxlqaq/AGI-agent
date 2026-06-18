@@ -100,25 +100,25 @@ public class UnifiedAgentService {
     }
 
     private void registerTool() {
-        // 注册知识库检索工具
-        Tool ragTool = Tool.builder()
-                .name("rag_search")
-                .description("从私人黑洞（个人知识库）中检索相关文档内容")
-                .parameters(List.of(ToolParam.builder()
-                                .name("query")
-                                .type("string")
-                                .description("检索关键词或问题")
-                                .required(true)
-                                .build()))
-                .execute(params -> {
-                    String query = (String) params.getOrDefault("query", "相关内容");
-                    if (!rag.isLoaded()) {
-                        throw new RuntimeException("知识库为空，请先上传文档");
-                    }
-                    return rag.query(query).getAnswer();
-                })
-                .build();
-        toolRegistry.registerTool(ragTool);
+//        // 注册知识库检索工具
+//        Tool ragTool = Tool.builder()
+//                .name("rag_search")
+//                .description("从私人黑洞（个人知识库）中检索相关文档内容")
+//                .parameters(List.of(ToolParam.builder()
+//                                .name("query")
+//                                .type("string")
+//                                .description("检索关键词或问题")
+//                                .required(true)
+//                                .build()))
+//                .execute(params -> {
+//                    String query = (String) params.getOrDefault("query", "相关内容");
+//                    if (!rag.isLoaded()) {
+//                        throw new RuntimeException("知识库为空，请先上传文档");
+//                    }
+//                    return rag.query(query).getAnswer();
+//                })
+//                .build();
+//        toolRegistry.registerTool(ragTool);
 
         // 注册互联网搜索工具
         Tool tool = Tool.builder()
@@ -333,17 +333,21 @@ public class UnifiedAgentService {
                 return;
             }
 
-            response.setMode("tool");
-            runToolFromSet(response, query, selectedTools, memoryPrefix, historyMessages);
-            return;
+//            response.setMode("tool");
+//            runToolFromSet(response, query, selectedTools, memoryPrefix, historyMessages);
+//            return;
         }
 
         if (request.isUseRag() && rag.isLoaded()) {
-            response.setMode("rag");
             RagQueryResult ragResult = rag.query(query);
-            response.setAnswer(ragResult.getAnswer());
-            response.setSearchResults(ragResult.getResults());
-            return;
+            // 命中知识库且分数可靠
+            if (ragResult.isHit() && ragResult.getMaxScore() >= cfg.getRag().getRagHitThreshold()) {
+                response.setMode("rag");
+                response.setAnswer(ragResult.getAnswer());
+                response.setSearchResults(ragResult.getResults());
+                return;
+            }
+            log.info("RAG未命中，降级普通对话");
         }
 
         response.setMode("chat");
@@ -368,11 +372,14 @@ public class UnifiedAgentService {
         }
 
         if (needRAG(query)) {
-            response.setMode("rag");
             RagQueryResult ragResult = rag.query(query);
-            response.setAnswer(ragResult.getAnswer());
-            response.setSearchResults(ragResult.getResults());
-            return;
+            // 命中知识库且分数可靠
+            if (ragResult.isHit() && ragResult.getMaxScore() >= cfg.getRag().getRagHitThreshold()) {
+                response.setMode("rag");
+                response.setAnswer(ragResult.getAnswer());
+                response.setSearchResults(ragResult.getResults());
+                return;
+            }
         }
 
         response.setMode("chat");
@@ -437,7 +444,10 @@ public class UnifiedAgentService {
     private void runToolFromSet(ChatResponse resp, String query, Map<String, Tool> ts,
                                 String memPrefix, List<Map<String, String>> histMsgs) {
         ToolCallResult tc = toolDecider.decide(query, ts);
-        if (tc == null) { resp.setAnswer("我无法处理这个请求。"); return; }
+        if (tc == null) {
+            resp.setAnswer("我无法处理这个请求。");
+            return;
+        }
 
         Tool tool = ts.get(tc.getToolName());
         if (tool == null) {
@@ -602,7 +612,9 @@ public class UnifiedAgentService {
                         pDescs.append(", ");
                     }
                     pDescs.append(p.getName()).append("(").append(p.getType()).append(")");
-                    if (p.getRequired()) pDescs.append("（必填）");
+                    if (p.getRequired()) {
+                        pDescs.append("（必填）");
+                    }
                 }
             }
             toolLines.append("- ").append(name).append(": ").append(t.getDescription())
